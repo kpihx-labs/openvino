@@ -30,7 +30,24 @@ def _discover_models() -> dict[str, dict]:
             p / "openvino_model.bin"
         ).exists()
         if has_ir:
-            models[p.name] = {"ir": p}
+            # Read context_length from config.json (max_position_embeddings → 32768/131072)
+            context_length = 32768  # default Qwen3
+            cfg = p / "config.json"
+            if cfg.exists():
+                try:
+                    j = json.loads(cfg.read_text())
+                    for key in (
+                        "max_position_embeddings",
+                        "max_position",
+                        "model_max_length",
+                        "seq_length",
+                    ):
+                        if key in j and isinstance(j[key], int):
+                            context_length = int(j[key])
+                            break
+                except Exception:  # noqa: BLE001, S110
+                    pass
+            models[p.name] = {"ir": p, "context_length": context_length}
     return models
 
 
@@ -64,10 +81,43 @@ def health():
 def list_models():
     models = _discover_models()
     data = [
-        {"id": m, "object": "model", "owned_by": "openvino"}
-        for m in sorted(models.keys())
+        {
+            "id": m,
+            "object": "model",
+            "owned_by": "openvino",
+            "context_length": info["context_length"],
+        }
+        for m, info in sorted(models.items())
     ]
     return {"object": "list", "data": data}
+
+
+@app.get("/v1/models/{model_id}")
+def get_model(model_id: str):
+    models = _discover_models()
+    # Handle both with and without colon normalization
+    candidates = [model_id, model_id.replace(":", "-"), model_id.replace("-", ":")]
+    for cand in candidates:
+        if cand in models:
+            info = models[cand]
+            return {
+                "id": cand,
+                "object": "model",
+                "owned_by": "openvino",
+                "context_length": info["context_length"],
+            }
+    norm = model_id.replace(":", "-").lower()
+    for k, info in models.items():
+        if k.lower() == norm or k.replace(":", "-").lower() == norm:
+            return {
+                "id": k,
+                "object": "model",
+                "owned_by": "openvino",
+                "context_length": info["context_length"],
+            }
+    return JSONResponse(
+        status_code=404, content={"error": f"model {model_id} not found"}
+    )
 
 
 @app.post("/v1/unload")
