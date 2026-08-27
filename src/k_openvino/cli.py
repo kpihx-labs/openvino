@@ -147,21 +147,48 @@ def pull(
         )
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
-    # Use the venv's optimum-cli (installed via project deps)
-    venv_optimum = Path.home() / ".local/share/openvino/venv/bin/optimum-cli"
-    cmd = [
-        str(venv_optimum),
-        "export",
-        "openvino",
-        "--model",
-        hf_id,
-        "--task",
-        "text-generation-with-past",
-        str(dest),
+    # Hint if unauthenticated (rate-limit causes 0% + incomplete total)
+    if (
+        not os.environ.get("HF_TOKEN")
+        and not (Path.home() / ".cache/huggingface/token").exists()
+    ):
+        console.print(
+            "[yellow]Note: HF_TOKEN not set — unauthenticated pull will be rate-limited (1-2 MB/s) and show `incomplete total` + `Fetching 0/5` until first shard completes.[/yellow]"
+        )
+        console.print(
+            "[dim]Fix: `hf auth login` (nouveau) ou `HF_TOKEN` dans ~/.agents/.env[/dim]"
+        )
+    # Locate optimum-cli robustly (project venv, uv tool venv, or PATH)
+    import shutil as _shutil
+
+    which = _shutil.which("optimum-cli")
+    candidates: list[Path] = [
+        Path.home() / "KpihX-Labs/AI/openvino/.venv/bin/optimum-cli",
+        Path.home() / ".local/share/uv/tools/k-openvino/bin/optimum-cli",
+        Path.home() / ".local/share/openvino/venv/bin/optimum-cli",
     ]
-    if not venv_optimum.exists():
+    if which:
+        candidates.append(Path(which))
+    optimum = next((p for p in candidates if p.exists() and p.is_file()), None)
+    use_uv_run = optimum is None
+    if use_uv_run:
         cmd = [
+            "uv",
+            "run",
+            "--project",
+            str(Path.home() / "KpihX-Labs/AI/openvino"),
             "optimum-cli",
+            "export",
+            "openvino",
+            "--model",
+            hf_id,
+            "--task",
+            "text-generation-with-past",
+            str(dest),
+        ]
+    else:
+        cmd = [
+            str(optimum),
             "export",
             "openvino",
             "--model",
@@ -175,6 +202,24 @@ def pull(
     env = os.environ.copy()
     hf_cache = Path.home() / ".cache/hf-export"
     env["HF_HOME"] = str(hf_cache)
+    # Fix: HF_HOME override hides token at ~/.cache/huggingface/token → ensure HF_TOKEN is set
+    if not env.get("HF_TOKEN"):
+        token_path = Path.home() / ".cache/huggingface/token"
+        if token_path.exists():
+            try:
+                env["HF_TOKEN"] = token_path.read_text().strip()
+            except Exception:  # noqa: BLE001, S110
+                pass
+        # Also copy token files to custom HF_HOME for huggingface_hub's file lookup
+        try:
+            hf_cache.mkdir(parents=True, exist_ok=True)
+            for src_name in ("token", "stored_tokens"):
+                src = Path.home() / ".cache/huggingface" / src_name
+                dst = hf_cache / src_name
+                if src.exists() and not dst.exists():
+                    shutil.copy(src, dst)
+        except Exception:  # noqa: BLE001, S110
+            pass
     try:
         subprocess.run(cmd, check=True, env=env)
         console.print(
