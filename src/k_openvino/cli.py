@@ -286,22 +286,28 @@ def run(
 
 @app.command("stop")
 def stop(model: str = typer.Argument(..., help="Model name to stop/unload")) -> None:
-    """Stop/unload a model (like `ollama stop <model>`)."""
+    """Stop/unload a model (like `ollama stop <model>`) — calls POST /v1/unload."""
     url = _url()
     try:
         console.print(f"[dim]Stopping model [cyan]{model}[/cyan]...[/dim]")
-        r = httpx.get(f"{url}/health", timeout=5.0)
+        r = httpx.post(f"{url}/v1/unload", json={"model": model}, timeout=30.0)
         if r.status_code == 200:
-            loaded = r.json().get("loaded")
-            norm = lambda s: s.replace(":", "-").lower()
-            if loaded and norm(loaded) == norm(model):
+            j = r.json()
+            unloaded = j.get("unloaded")
+            if unloaded:
                 console.print(
-                    f"[yellow]Model {loaded} is currently loaded — will be unloaded on next restart.[/yellow]"
+                    f"[green]✓ unloaded {unloaded} (VRAM freed, IR remains)[/green]"
                 )
+            else:
+                console.print("[dim]No model was loaded[/dim]")
                 console.print(
-                    "[dim]Tip: `openvino server restart` to fully clear VRAM.[/dim]"
+                    f"[green]✓ stop {model} (IR remains, use `rm` to delete)[/green]"
                 )
-        console.print(f"[green]✓ stop {model} (IR remains, use `rm` to delete)[/green]")
+        else:
+            console.print(f"[yellow]Server returned {r.status_code}: {r.text}[/yellow]")
+            console.print(
+                f"[green]✓ stop {model} (IR remains, use `rm` to delete)[/green]"
+            )
     except Exception as e:  # noqa: BLE001
         console.print(f"[red]Could not reach server: {e}[/red]")
         console.print("[dim]Local stop done — restart server to clear memory.[/dim]")
@@ -318,10 +324,36 @@ def server_install() -> None:
         console.print(f"[red]Service file not found: {service_src}[/red]")
         sys.exit(1)
     user_service.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy(service_src, user_service)
+    try:
+        if user_service.exists() and user_service.resolve() == service_src.resolve():
+            console.print(f"[dim]Service already installed @ {user_service}[/dim]")
+        else:
+            shutil.copy(service_src, user_service)
+    except shutil.SameFileError:
+        console.print(f"[dim]Service already installed @ {user_service}[/dim]")
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
     subprocess.run(["systemctl", "--user", "enable", "openvino.service"], check=False)
     console.print(f"[green]✓ Service installed @ {user_service}[/green]")
+
+
+@server_app.command("uninstall")
+def server_uninstall() -> None:
+    """Uninstall the systemd service."""
+    user_service = Path.home() / ".config/systemd/user/openvino.service"
+    wants = Path.home() / ".config/systemd/user/default.target.wants/openvino.service"
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "disable", "--now", "openvino.service"],
+            check=False,
+        )
+    except Exception:  # noqa: BLE001, S110
+        pass
+    for p in (user_service, wants):
+        if p.exists() or p.is_symlink():
+            p.unlink(missing_ok=True)
+            console.print(f"[dim]Removed {p}[/dim]")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    console.print("[green]✓ Service uninstalled[/green]")
 
 
 @server_app.command("start")

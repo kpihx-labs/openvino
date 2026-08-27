@@ -70,6 +70,40 @@ def list_models():
     return {"object": "list", "data": data}
 
 
+@app.post("/v1/unload")
+async def unload(req: Request):
+    """Unload the currently loaded model (free VRAM)."""
+    try:
+        body = await req.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    requested = body.get("model")
+    loaded: str | None = _current["name"]  # type: ignore[assignment]
+    if loaded is None:
+        return {"status": "ok", "unloaded": None, "message": "no model loaded"}
+    # If a specific model was requested and it doesn't match the loaded one, 404
+    if (
+        requested
+        and requested != loaded
+        and requested.replace(":", "-") != loaded  # type: ignore[attr-defined]
+        and loaded.replace(":", "-") != requested  # type: ignore[attr-defined]
+    ):
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"model {requested} not loaded, currently {loaded}"},
+        )
+    unloaded = loaded
+    _current["name"] = None
+    _current["pipe"] = None
+    _current["tok"] = None
+    import gc
+
+    gc.collect()
+    return {"status": "ok", "unloaded": unloaded}
+
+
 @app.post("/v1/chat/completions")
 async def chat(req: Request):
     body = await req.json()
