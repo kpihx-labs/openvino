@@ -1,0 +1,87 @@
+.DEFAULT_GOAL := help
+SHELL := /bin/zsh
+
+PKG_NAME     := k-openvino
+PKG_DIR_NAME := k_openvino
+PKG_DIR      := src/$(PKG_DIR_NAME)
+VERSION      := $(shell grep -m 1 version pyproject.toml | tr -s ' ' | tr -d '"' | tr -d "'" | cut -d= -f2 | xargs)
+
+UV     := $(shell command -v uv 2>/dev/null || echo uv)
+PYTHON := $(UV) run python
+
+PY_FILES := $(shell $(UV) run python -c 'from pathlib import Path; print(" ".join(map(str, Path("$(PKG_DIR)").rglob("*.py"))))')
+
+.PHONY: help check smoke install link uninstall uv-build uv-publish push push-tags status log release
+
+help:  ## Show available targets
+	@grep -E '^[a-zA-Z_-]+:.*?##' $(MAKEFILE_LIST) | \
+	  awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
+
+# ── Quality ──────────────────────────────────────────────────────────────────
+
+check: smoke  ## Lint + format-check + type-check + tests (also run by the global pre-commit gate, see k-git)
+	@$(UV) run ruff check $(PKG_DIR)
+	@$(UV) run ruff format --check $(PKG_DIR)
+	@$(PYTHON) -m py_compile $(PY_FILES)
+	@$(UV) run pyright $(PKG_DIR)
+	@$(UV) run pytest -q
+
+smoke:  ## Smoke test — adjust to a real CLI/import check for this project
+	@$(PYTHON) -c "import $(PKG_DIR_NAME)" || (echo "❌ smoke test failed"; exit 1)
+	@echo "✅ smoke test passed"
+
+# ── Install / Uninstall (uv tool) ────────────────────────────────────────────
+
+install:  ## Install via uv tool (non-editable)
+	@$(UV) tool install . --force
+	@mkdir -p ~/.config/systemd/user
+	@ln -sf $(PWD)/openvino.service ~/.config/systemd/user/openvino.service
+	@systemctl --user daemon-reload
+	@systemctl --user enable openvino.service || true
+	@echo "✅ $(PKG_NAME) installed + service @ ~/.config/systemd/user/openvino.service"
+
+link:  ## Install editable (dev) — CLI always uses the current checkout
+	@$(UV) tool install --editable . --force
+	@mkdir -p ~/.config/systemd/user
+	@ln -sf $(PWD)/openvino.service ~/.config/systemd/user/openvino.service
+	@systemctl --user daemon-reload
+	@systemctl --user enable openvino.service || true
+	@echo "✅ $(PKG_NAME) linked (editable) + service"
+
+uninstall:  ## Uninstall the uv tool
+	@$(UV) tool uninstall $(PKG_NAME) 2>/dev/null || true
+	@systemctl --user disable --now openvino.service 2>/dev/null || true
+	@rm -f ~/.config/systemd/user/openvino.service
+	@systemctl --user daemon-reload 2>/dev/null || true
+	@echo "✅ $(PKG_NAME) uninstalled + service removed"
+
+# ── Build / Publish ──────────────────────────────────────────────────────────
+
+uv-build:  ## Build sdist + wheel
+	@rm -rf dist
+	@echo "🏗️  Building $(PKG_NAME) v$(VERSION)..."
+	@$(UV) build
+
+uv-publish: uv-build  ## Publish to PyPI (requires UV_PUBLISH_TOKEN already in the environment)
+	@echo "🚀 Publishing v$(VERSION) to PyPI..."
+	@$(UV) publish
+
+# ── Git ───────────────────────────────────────────────────────────────────────
+
+push:  ## Push current branch to all remotes
+	@branch="$$(git branch --show-current)"; \
+	for remote in $$(git remote); do \
+		echo "==> pushing $$branch to $$remote"; \
+		git push "$$remote" "$$branch"; \
+	done
+
+push-tags:  ## Push all tags to all remotes
+	@for remote in $$(git remote); do git push "$$remote" --tags; done
+
+status:  ## git status --short
+	@git status --short
+
+log:  ## Last 10 commits oneline
+	@git log --oneline -10
+
+release: check push uv-publish push-tags  ## Full release: check → push → publish → push tags

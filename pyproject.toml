@@ -1,0 +1,52 @@
+[project]
+name        = "k-openvino"
+version     = "0.1.0"
+description = "OpenVINO GenAI OpenAI-compatible server + CLI (sovereign local LLM)"
+authors     = [{ name = "KAMDEM Ivann", email = "kapoivha@gmail.com" }]
+readme      = "README.md"
+license     = { text = "MIT" }
+requires-python = ">=3.12"
+
+dependencies = [
+    "openvino-genai==2026.3.1",
+    "optimum-intel==2.1.0",
+    "transformers",
+    "fastapi",
+    "uvicorn",
+    "huggingface_hub",
+    "httpx",
+    "typer",
+    "rich",
+    "python-dotenv",
+]
+
+[project.scripts]
+openvino = "k_openvino.cli:app"
+
+[tool.uv]
+package = true
+
+[build-system]
+requires      = ["uv_build>=0.10.3,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "k_openvino"
+
+# ── Optional dependency groups ──────────────────────────────────────────────
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "pytest-asyncio",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+# Contract metadata (mandatory when CONTRACT.md exists)
+[tool.k-openvino.contract]
+schema_version = "openvino.contract.v1"
+contract_version = "1.0.0"
+source = "CONTRACT.md"
