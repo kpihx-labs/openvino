@@ -135,9 +135,15 @@ def pull(
     name: str = typer.Argument(
         ..., help="Model name (e.g. qwen3:1.7b) or HF id (Qwen/Qwen3-1.7B)"
     ),
-    hf: str = typer.Option(None, "--hf", help="Override HF repo id"),
+    hf: str = typer.Option(None, "--hf", "-H", help="Override HF repo id"),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "-f",
+        help="Force pull even if not safe (à vos risques et périls)",
+    ),
 ) -> None:
-    """Export a Hugging Face model to OpenVINO IR (like ollama pull)."""
+    """Export a Hugging Face model to OpenVINO IR (like ollama pull) — strict by default, safe only."""
     hf_id = _hf_id(name, hf)
     local = _local_name(name if "/" not in name else hf_id)
     dest = _models_dir() / local
@@ -147,6 +153,120 @@ def pull(
         )
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
+    # ── Strict, flexible, dynamic safety checks (disk/RAM/GPU) — block by default if not safe ──
+    if not force:
+        # PC caps (dynamic, no hardcoding)
+        import shutil as _shutil2
+
+        # Disk avail for models + HF cache (conservative: need 2× model size + 2GB margin)
+        models_dir = _models_dir()
+        hf_cache_dir = Path.home() / ".cache/hf-export"
+        try:
+            models_avail = (
+                _shutil2.disk_usage(models_dir).free
+                if models_dir.exists()
+                else _shutil2.disk_usage(Path.home()).free
+            )
+            cache_avail = (
+                _shutil2.disk_usage(hf_cache_dir).free
+                if hf_cache_dir.exists()
+                else _shutil2.disk_usage(Path.home()).free
+            )
+            disk_avail = min(models_avail, cache_avail)
+        except Exception:  # noqa: BLE001
+            disk_avail = 0
+        # RAM avail
+        ram_avail = 0
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        ram_avail = int(line.split()[1]) * 1024  # kB → bytes
+                        break
+        except Exception:  # noqa: BLE001, S110
+            pass
+        # GPU — dynamic, not hardcoded for one machine (shared memory = RAM on Arc, else VRAM)
+        gpu_name = "unknown"
+        try:
+            lspci = subprocess.run(
+                ["lspci"], capture_output=True, text=True, timeout=3, check=False
+            )
+            if "Intel" in lspci.stdout and "Arc" in lspci.stdout:
+                gpu_name = "Intel Arc"
+            elif "Intel" in lspci.stdout:
+                gpu_name = "Intel iGPU"
+        except Exception:  # noqa: BLE001, S110
+            pass
+        # Model caps via HF (size + type) — strict but flexible, dynamic (not hardcoded for one machine)
+        model_size = None
+        model_type = None
+        try:
+            from huggingface_hub import HfApi
+
+            api = HfApi()
+            info = api.model_info(hf_id)
+            # Total size from safetensors
+            if info.safetensors and info.safetensors.total:
+                model_size = int(info.safetensors.total)
+            # Type from config
+            if info.config and isinstance(info.config, dict):
+                model_type = info.config.get("model_type")
+            elif hasattr(info, "cardData") and info.cardData:
+                # fallback: try to get from cardData
+                pass
+        except Exception:  # noqa: BLE001, S110
+            pass
+        # Whitelist — dynamic, not hardcoded for one machine (override via OPENVINO_COMPATIBLE_TYPES)
+        compatible_types = set(
+            os.environ.get(
+                "OPENVINO_COMPATIBLE_TYPES",
+                "qwen3,qwen2,qwen,llama,mistral,gemma,phi,gpt_neox,chatglm",
+            ).split(",")
+        )
+        if model_type and model_type not in compatible_types:
+            console.print(
+                f"[red]✗ pull bloqué — model_type '{model_type}' non supporté sur Arc (whitelist: {', '.join(sorted(compatible_types))})[/red]"
+            )
+            console.print(
+                "[dim]Utilise --force pour forcer (à vos risques et périls)[/dim]"
+            )
+            sys.exit(1)
+        # Size checks (conservative: need disk 2× size + RAM 1.5× size)
+        if model_size:
+            # Dynamic, not hardcoded for one machine — override via OPENVINO_* env
+            disk_factor = float(os.environ.get("OPENVINO_DISK_FACTOR", "2.0"))
+            ram_factor = float(os.environ.get("OPENVINO_RAM_FACTOR", "1.5"))
+            disk_margin = int(os.environ.get("OPENVINO_DISK_MARGIN_GB", "2")) * 1024**3
+            ram_margin = int(os.environ.get("OPENVINO_RAM_MARGIN_GB", "2")) * 1024**3
+            need_disk = int(model_size * disk_factor) + disk_margin
+            need_ram = int(model_size * ram_factor) + ram_margin
+            size_gb = model_size / 1024**3
+            disk_gb = disk_avail / 1024**3
+            ram_gb = ram_avail / 1024**3
+            # Disk check
+            if disk_avail < need_disk:
+                console.print(
+                    f"[red]✗ pull bloqué — disque insuffisant: {size_gb:.1f}G model → besoin ~{need_disk / 1024**3:.1f}G, dispo {disk_gb:.1f}G[/red]"
+                )
+                console.print(
+                    f"[dim]Modèle: {hf_id} ({size_gb:.1f}G), disque dispo: {disk_gb:.1f}G (besoin 2× + 2G). Nettoie ou utilise --force[/dim]"
+                )
+                console.print(
+                    "[dim]Hier Qwen/Qwen3-8B (16G) a rempli le disque (5G dispo) et a OOM le PC — bloqué par défaut pour sûreté.[/dim]"
+                )
+                sys.exit(1)
+            # RAM check (Arc shares RAM, so RAM ≈ VRAM)
+            if ram_avail and ram_avail < need_ram:
+                console.print(
+                    f"[red]✗ pull bloqué — RAM insuffisante: {size_gb:.1f}G model → besoin ~{need_ram / 1024**3:.1f}G, dispo {ram_gb:.1f}G ({gpu_name})[/red]"
+                )
+                console.print(
+                    "[dim]Utilise --force pour forcer, mais risque OOM et plantage PC (comme hier avec 8B)[/dim]"
+                )
+                sys.exit(1)
+            console.print(
+                f"[dim]✓ Check strict: {size_gb:.1f}G model, disque {disk_gb:.1f}G, RAM {ram_gb:.1f}G, GPU {gpu_name} — sûr[/dim]"
+            )
     # Hint if unauthenticated (rate-limit causes 0% + incomplete total)
     if (
         not os.environ.get("HF_TOKEN")
@@ -258,23 +378,175 @@ def rm_cmd(name: str = typer.Argument(..., help="Model name to remove")) -> None
 @app.command("search")
 def search(
     query: str = typer.Argument(..., help="Search Hugging Face for models"),
+    all: bool = typer.Option(
+        False, "--all", "-a", help="Show all, even incompatible (yellow with reason)"
+    ),
+    limit: int = typer.Option(
+        20, "--limit", "-n", help="Number of results (default 20, e.g. 100)"
+    ),
+    max_params: str = typer.Option(
+        None,
+        "--max-params",
+        "-m",
+        help="Max params (e.g. 1.7B, 8B, 5B) — filter by model size",
+    ),
 ) -> None:
-    """Search Hugging Face Hub for models (online)."""
+    """Search Hugging Face Hub for models (online) — strict by default, safe only."""
     try:
         from huggingface_hub import HfApi
 
         api = HfApi()
-        models = api.list_models(search=query, limit=20, sort="downloads")
-        table = Table(title=f"Hugging Face search: {query}")
+        # PC caps for dynamic checks (same as pull) — flexible, not hardcoded for one machine
+        import shutil as _shutil2
+
+        models_dir = _models_dir()
+        hf_cache_dir = Path.home() / ".cache/hf-export"
+        try:
+            models_avail = (
+                _shutil2.disk_usage(models_dir).free
+                if models_dir.exists()
+                else _shutil2.disk_usage(Path.home()).free
+            )
+            cache_avail = (
+                _shutil2.disk_usage(hf_cache_dir).free
+                if hf_cache_dir.exists()
+                else _shutil2.disk_usage(Path.home()).free
+            )
+            disk_avail = min(models_avail, cache_avail)
+        except Exception:  # noqa: BLE001
+            disk_avail = 0
+        ram_avail = 0
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        ram_avail = int(line.split()[1]) * 1024
+                        break
+        except Exception:  # noqa: BLE001, S110
+            pass
+        compatible_types = set(
+            os.environ.get(
+                "OPENVINO_COMPATIBLE_TYPES",
+                "qwen3,qwen2,qwen,llama,mistral,gemma,phi,gpt_neox,chatglm",
+            ).split(",")
+        )
+
+        # Parse max_params (e.g. 8B → 8e9) — flexible, dynamic
+        max_size: float | None = None
+        if max_params:
+            try:
+                s = max_params.strip().upper()
+                mult = 1.0
+                if s.endswith("B"):
+                    mult = 1e9
+                    s = s[:-1]
+                elif s.endswith("M"):
+                    mult = 1e6
+                    s = s[:-1]
+                elif s.endswith("K"):
+                    mult = 1e3
+                    s = s[:-1]
+                max_size = float(s) * mult
+            except Exception:  # noqa: BLE001
+                console.print(
+                    f"[red]Invalid --max-params '{max_params}' (use e.g. 1.7B, 8B, 5B)[/red]"
+                )
+                sys.exit(1)
+        # Fetch a bit more than limit to account for filtering (strict mode may skip many)
+        fetch_limit = max(limit * 2, 30) if not all else limit * 2
+        raw_models = api.list_models(search=query, limit=fetch_limit, sort="downloads")
+        table = Table(
+            title=f"Hugging Face search: {query} ({'all' if all else 'compatible only'}{f', max {max_params}' if max_params else ''})"
+        )
         table.add_column("ID", style="cyan")
+        table.add_column("Size", justify="right")
+        table.add_column("Type", style="dim")
         table.add_column("Downloads", justify="right")
         table.add_column("Likes", justify="right")
-        for m in models:
-            table.add_row(m.id, str(m.downloads), str(m.likes))
+        if all:
+            table.add_column("Status", style="yellow")
+        shown = 0
+        skipped = 0
+        for m in raw_models:
+            # Try to get size and type — dynamic, not hardcoded for one machine
+            m_id = m.id
+            m_type = None
+            m_size = None
+            # From list result, try to get config
+            if hasattr(m, "config") and isinstance(m.config, dict):
+                m_type = m.config.get("model_type")
+            if hasattr(m, "safetensors") and m.safetensors and m.safetensors.total:
+                m_size = int(m.safetensors.total)
+            # Fallback: fetch model_info for accurate size/type (flexible, dynamic for any machine)
+            if (m_size is None or m_type is None) and (max_size or not all):
+                try:
+                    info2 = api.model_info(m_id)
+                    if m_size is None and info2.safetensors and info2.safetensors.total:
+                        m_size = int(info2.safetensors.total)
+                    if (
+                        m_type is None
+                        and info2.config
+                        and isinstance(info2.config, dict)
+                    ):
+                        m_type = info2.config.get("model_type")
+                except Exception:  # noqa: BLE001, S110
+                    pass
+            # Fallback: try model_info for more accurate size/type (but may be slow, so only if needed for strict check)
+            # For strict mode, we need to know if it's compatible; if we can't get info, assume unknown and show as compatible
+            reason = None
+            if m_type and m_type not in compatible_types:
+                reason = f"type {m_type} not in Arc whitelist"
+            elif m_size:
+                # Dynamic, not hardcoded for one machine — same env as pull
+                _disk_factor = float(os.environ.get("OPENVINO_DISK_FACTOR", "2.0"))
+                _ram_factor = float(os.environ.get("OPENVINO_RAM_FACTOR", "1.5"))
+                _disk_margin = (
+                    int(os.environ.get("OPENVINO_DISK_MARGIN_GB", "2")) * 1024**3
+                )
+                _ram_margin = (
+                    int(os.environ.get("OPENVINO_RAM_MARGIN_GB", "2")) * 1024**3
+                )
+                need_disk = int(m_size * _disk_factor) + _disk_margin
+                need_ram = int(m_size * _ram_factor) + _ram_margin
+                if disk_avail < need_disk:
+                    reason = f"disk {m_size / 1024**3:.1f}G → need {need_disk / 1024**3:.1f}G, avail {disk_avail / 1024**3:.1f}G"
+                elif ram_avail and ram_avail < need_ram:
+                    reason = f"RAM {m_size / 1024**3:.1f}G → need {need_ram / 1024**3:.1f}G, avail {ram_avail / 1024**3:.1f}G"
+                elif max_size and m_size > max_size:
+                    reason = f"size {m_size / 1024**3:.1f}G > max {max_params}"
+            # Strict: skip incompatible unless --all
+            if reason and not all:
+                skipped += 1
+                continue
+            size_str = f"{m_size / 1024**3:.1f}G" if m_size else "?"
+            type_str = m_type or "?"
+            if reason and all:
+                # Yellow with reason
+                table.add_row(
+                    f"[yellow]{m_id}[/yellow]",
+                    f"[yellow]{size_str}[/yellow]",
+                    f"[yellow]{type_str}[/yellow]",
+                    f"[yellow]{m.downloads}[/yellow]",
+                    f"[yellow]{m.likes}[/yellow]",
+                    f"[yellow]{reason}[/yellow]",
+                )
+            else:
+                table.add_row(m_id, size_str, type_str, str(m.downloads), str(m.likes))
+            shown += 1
+            if shown >= limit:
+                break
         console.print(table)
+        if skipped and not all:
+            console.print(
+                f"[dim]{skipped} incompatible hidden — use --all to see all (yellow with reason)[/dim]"
+            )
         console.print(
             "[dim]Pull with: openvino pull <model-id>  (e.g. Qwen/Qwen3-1.7B)[/dim]"
         )
+        if not all:
+            console.print(
+                "[dim]Strict by default: only Arc-compatible + fits disk/RAM shown. Use --all for all.[/dim]"
+            )
     except Exception as e:  # noqa: BLE001
         console.print(f"[red]search failed (offline?): {e}[/red]")
         console.print("[dim]Try: openvino pull <HF_ID>  (e.g. Qwen/Qwen3-1.7B)[/dim]")
@@ -470,8 +742,8 @@ def server_status() -> None:
 def server_logs(
     follow: bool = typer.Option(False, "--follow", "-f", help="Follow logs"),
     lines: int = typer.Option(100, "--lines", "-n", help="Number of lines"),
-    since: str = typer.Option(None, "--since", help="Since (e.g. 5m, 1h, today)"),
-    no_pager: bool = typer.Option(False, "--no-pager", help="No pager"),
+    since: str = typer.Option(None, "--since", "-s", help="Since (e.g. 5m, 1h, today)"),
+    no_pager: bool = typer.Option(False, "--no-pager", "-P", help="No pager"),
 ) -> None:
     """Show server logs (journalctl)."""
     cmd = ["journalctl", "--user", "-u", "openvino.service", "-n", str(lines)]
