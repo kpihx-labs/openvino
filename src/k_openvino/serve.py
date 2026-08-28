@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 
@@ -60,10 +61,19 @@ def _load(name: str):
             f"Model not found: {name} (available: {list(discovered.keys())})"
         )
     ir = discovered[name]["ir"]
+    device = os.environ.get("OPENVINO_DEVICE", "GPU")
+    # GPU Arc OOM even for 0.6B (5.4G peak + 3G swap) → LATENCY + 1 stream to cut VRAM
+    cfg: dict[str, str] = {}
+    if device == "GPU":
+        cfg = {"PERFORMANCE_HINT": "LATENCY", "NUM_STREAMS": "1"}
     try:
-        pipe = openvino_genai.LLMPipeline(str(ir), device="GPU")
+        pipe = (
+            openvino_genai.LLMPipeline(str(ir), device, cfg)
+            if cfg
+            else openvino_genai.LLMPipeline(str(ir), device)
+        )
     except Exception:  # noqa: BLE001
-        pipe = openvino_genai.LLMPipeline(str(ir), device="CPU")
+        pipe = openvino_genai.LLMPipeline(str(ir), "CPU")
     tok = AutoTokenizer.from_pretrained(str(ir))
     _current["name"] = name
     _current["pipe"] = pipe

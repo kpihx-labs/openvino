@@ -1,5 +1,5 @@
 [Unit]
-Description=OpenVINO GenAI LLM server (OpenAI-compatible) on port 11436
+Description=OpenVINO GenAI LLM server (OpenAI-compatible) on port 11437
 After=network.target
 
 [Service]

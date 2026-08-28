@@ -47,7 +47,7 @@ def get_secret(name: str, *, required: bool = True) -> str:
 @dataclass(frozen=True)
 class Config:
     host: str = "127.0.0.1"
-    port: int = 11436
+    port: int = 11437
     log_level: str = "INFO"
     debug: bool = False
 
