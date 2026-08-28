@@ -194,6 +194,13 @@ async def chat(req: Request):
     if not stream:
         result = pipe.generate(prompt, config)  # type: ignore[union-attr]
         text = result.text if hasattr(result, "text") else str(result)
+        # Real usage for opencode's 490.9K (47%) · $59.11 display — was 0 (vide)
+        try:
+            prompt_tokens = len(tok.encode(prompt))  # type: ignore[union-attr]
+            completion_tokens = len(tok.encode(text))  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            prompt_tokens = len(prompt) // 4
+            completion_tokens = len(text) // 4
         return {
             "id": "chatcmpl-openvino",
             "object": "chat.completion",
@@ -205,7 +212,11 @@ async def chat(req: Request):
                     "finish_reason": "stop",
                 }
             ],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
         }
     q: queue.Queue[str | None] = queue.Queue()
 
