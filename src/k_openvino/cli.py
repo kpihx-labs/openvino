@@ -477,20 +477,15 @@ def search(
                 m_type = m.config.get("model_type")
             if hasattr(m, "safetensors") and m.safetensors and m.safetensors.total:
                 m_size = int(m.safetensors.total)
-            # Fallback: fetch model_info for accurate size/type (flexible, dynamic for any machine)
-            if (m_size is None or m_type is None) and (max_size or not all):
-                try:
-                    info2 = api.model_info(m_id)
-                    if m_size is None and info2.safetensors and info2.safetensors.total:
-                        m_size = int(info2.safetensors.total)
-                    if (
-                        m_type is None
-                        and info2.config
-                        and isinstance(info2.config, dict)
-                    ):
-                        m_type = info2.config.get("model_type")
-                except Exception:  # noqa: BLE001, S110
-                    pass
+            # Always refetch for accurate size — list gives 7.6G truncated, real is 16.4G (5 shards)
+            try:
+                info2 = api.model_info(m_id)
+                if info2.safetensors and info2.safetensors.total:
+                    m_size = int(info2.safetensors.total)
+                if info2.config and isinstance(info2.config, dict):
+                    m_type = info2.config.get("model_type") or m_type
+            except Exception:  # noqa: BLE001, S110
+                pass
             # Fallback: try model_info for more accurate size/type (but may be slow, so only if needed for strict check)
             # For strict mode, we need to know if it's compatible; if we can't get info, assume unknown and show as compatible
             reason = None
