@@ -1,6 +1,6 @@
 [project]
 name        = "k-openvino"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "OpenVINO GenAI OpenAI-compatible server + CLI (sovereign local LLM)"
 authors     = [{ name = "KAMDEM Ivann", email = "kapoivha@gmail.com" }]
 readme      = "README.md"

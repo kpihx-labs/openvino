@@ -37,13 +37,13 @@ openvino run qwen3:1.7b "Bonjour"
 
 # Server (systemd)
 systemctl --user enable --now openvino.service
-curl -s http://127.0.0.1:11436/health | jq
-curl -s http://127.0.0.1:11436/v1/models | jq
+curl -s http://127.0.0.1:11437/health | jq
+curl -s http://127.0.0.1:11437/v1/models | jq
 
 # Env
 OPENVINO_HOME=~/.local/share/openvino  # models root
-OPENVINO_URL=http://127.0.0.1:11436
-OPENVINO_HOST=127.0.0.1:11436   # or :11436 (Ollama-style)
+OPENVINO_URL=http://127.0.0.1:11437
+OPENVINO_HOST=127.0.0.1:11437   # or just :11437 (Ollama-style, host optional)
 ```
 
 ## Development
