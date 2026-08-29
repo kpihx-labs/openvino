@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv  # python-dotenv
 
@@ -50,6 +51,24 @@ class Config:
     port: int = 11437
     log_level: str = "INFO"
     debug: bool = False
+    max_context: int = 32768  # Central cap — IR on Intel Arc GPU unreliable above this
+    # Absolute default (industry range 4K-16K) — never a ratio of max_context: real
+    # providers (GPT-4o, Gemini, DeepSeek) use a flat cap independent of context size.
+    default_output_tokens: int = 8192
+    # Qwen3's chat template defaults to a verbose <think> chain-of-thought that
+    # can burn hundreds of tokens before ever emitting a tool call — great for
+    # hard reasoning, bad for a fast agent (Lite). Per-request `enable_thinking`
+    # in the request body overrides this; this is only the server default.
+    default_enable_thinking: bool = True
+    # Streaming requests run in a dedicated subprocess so a client disconnect can
+    # kill a still-prefilling generation that Python's high-level
+    # LLMPipeline.generate() API cannot otherwise interrupt.
+    stream_worker_spawn_method: Literal["spawn", "fork", "forkserver"] = "spawn"
+    # After a client disconnect, first ask the worker to cancel gracefully via
+    # StreamingStatus.CANCEL; if it still hasn't stopped after this grace period,
+    # kill the worker subprocess (covers the prefill-before-first-token case).
+    stream_cancel_grace_seconds: float = 0.75
+    stream_worker_shutdown_timeout_seconds: float = 2.0
 
     @property
     def url(self) -> str:

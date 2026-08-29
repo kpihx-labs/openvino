@@ -51,6 +51,51 @@ def _hf_id(arg: str, hf_opt: str | None) -> str:
     return arg
 
 
+def _hf_accurate_size(api: object, hf_id: str) -> int | None:
+    """Real download size in bytes for the checkpoint `optimum-cli` will actually load.
+
+    `info.safetensors.total` is unreliable and can undercount by 2x+ (e.g.
+    mistralai/Mistral-7B-Instruct-v0.3: reported 6.8G, real download 14.5G —
+    the pre-flight disk/RAM safety check passed on the wrong number and the
+    export later crashed with ENOSPC). Naively summing every sibling weight
+    file is also wrong: some repos ship duplicate full-weight distributions
+    in different formats (that same repo ALSO carries a single 13.5G
+    `consolidated.safetensors` for `mistral-inference`, on top of the 13.5G
+    `model-0000X-of-00003.safetensors` shards `transformers`/`optimum-cli`
+    actually loads — a naive sum double-counts to ~27G). Target the exact
+    `transformers` checkpoint convention `optimum-cli` follows, in priority
+    order, so both `pull` and `search` get the one real number.
+    """
+    try:
+        info = api.model_info(hf_id, files_metadata=True)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        return None
+    siblings = {s.rfilename: s.size for s in (info.siblings or []) if s.size}
+    shard_sizes = [
+        size
+        for name, size in siblings.items()
+        if name.startswith("model-") and name.endswith(".safetensors")
+    ]
+    if shard_sizes:
+        return sum(shard_sizes)
+    if "model.safetensors" in siblings:
+        return siblings["model.safetensors"]
+    shard_sizes = [
+        size
+        for name, size in siblings.items()
+        if name.startswith("pytorch_model-") and name.endswith(".bin")
+    ]
+    if shard_sizes:
+        return sum(shard_sizes)
+    if "pytorch_model.bin" in siblings:
+        return siblings["pytorch_model.bin"]
+    # Fallback — no recognized transformers convention found, best-effort sum
+    # (may overcount if the repo carries duplicate formats).
+    weight_exts = (".safetensors", ".bin", ".pt", ".pth")
+    sizes = [size for name, size in siblings.items() if name.endswith(weight_exts)]
+    return sum(sizes) if sizes else None
+
+
 @app.command("ls")
 def ls() -> None:
     """List local IR models."""
@@ -204,10 +249,8 @@ def pull(
             from huggingface_hub import HfApi
 
             api = HfApi()
+            model_size = _hf_accurate_size(api, hf_id)
             info = api.model_info(hf_id)
-            # Total size from safetensors
-            if info.safetensors and info.safetensors.total:
-                model_size = int(info.safetensors.total)
             # Type from config
             if info.config and isinstance(info.config, dict):
                 model_type = info.config.get("model_type")
@@ -475,13 +518,11 @@ def search(
             # From list result, try to get config
             if hasattr(m, "config") and isinstance(m.config, dict):
                 m_type = m.config.get("model_type")
-            if hasattr(m, "safetensors") and m.safetensors and m.safetensors.total:
-                m_size = int(m.safetensors.total)
-            # Always refetch for accurate size — list gives 7.6G truncated, real is 16.4G (5 shards)
+            # Always refetch for accurate size via real sibling file sizes —
+            # `safetensors.total` (list or model_info) is unreliable, see _hf_accurate_size.
+            m_size = _hf_accurate_size(api, m_id) or m_size
             try:
                 info2 = api.model_info(m_id)
-                if info2.safetensors and info2.safetensors.total:
-                    m_size = int(info2.safetensors.total)
                 if info2.config and isinstance(info2.config, dict):
                     m_type = info2.config.get("model_type") or m_type
             except Exception:  # noqa: BLE001, S110
