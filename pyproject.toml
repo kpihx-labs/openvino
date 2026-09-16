@@ -1,6 +1,6 @@
 [project]
 name        = "k-openvino"
-version     = "0.2.0"
+version     = "0.3.0"
 description = "OpenVINO GenAI OpenAI-compatible server + CLI (sovereign local LLM)"
 authors     = [{ name = "KAMDEM Ivann", email = "kapoivha@gmail.com" }]
 readme      = "README.md"
@@ -10,7 +10,11 @@ requires-python = ">=3.12"
 dependencies = [
     "openvino-genai==2026.3.1",
     "optimum-intel==2.1.0",
-    "transformers",
+    # transformers>=5.10 required for recent multimodal HF architectures that
+    # optimum-intel 2.1.0 still declares as transformers<5.6 — see override below.
+    "transformers>=5.10.0,<5.11",
+    "pillow",
+    "numpy",
     "fastapi",
     "uvicorn",
     "huggingface_hub",
@@ -25,6 +29,12 @@ openvino = "k_openvino.cli:app"
 
 [tool.uv]
 package = true
+# Force transformers 5.10 despite optimum-intel 2.1.0's declared <5.6 upper bound.
+# Needed so export can load recent multimodal architectures; GenAI LLM IR serve
+# path does not depend on this pin for already-exported models.
+override-dependencies = [
+    "transformers>=5.10.0,<5.11",
+]
 
 [build-system]
 requires      = ["uv_build>=0.10.3,<0.11.0"]

@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 0.3.0 — 2026-09-15
+
+- cli: purge baked-in model-family whitelists — `OPENVINO_COMPATIBLE_TYPES` is optional restrict-only (unset = any architecture); multimodal export task chosen from HF config STRUCTURE (`vision_config` / architecture markers / processor siblings), never from a name list
+- cli: `pull --task` / `--weight-format` overrides; multimodal defaults to `image-text-to-text` + `OPENVINO_WEIGHT_FORMAT` (default `int4`); IR detection covers both `openvino_model.xml` and `openvino_language_model.xml`
+- cli: architecture-agnostic `ACTIVATIONS_SCALE_FACTOR` 8.0→`OPENVINO_ACTIVATIONS_SCALE` (default 64.0) post-export patch when present
+- serve: FIX — VLMPipeline text-only/image generate uses `generation_config=` kwarg (positional GenerationConfig raises TypeError on openvino_genai 2026.3.1)
+- cli: FIX — stop wiping `~/.cache/hf-export` after pull (kept a 23.9G re-download after failed export); set disk-backed `TMPDIR=~/.cache/openvino-export-tmp` so INT4 FP16 intermediates do not ENOSPC on `/tmp` tmpfs (`basic_ios::clear: iostream error` / optimum-intel#1707)
+- serve: general VLM path — IR layout selects `VLMPipeline` vs `LLMPipeline`; OpenAI `image_url` parts (data URI / local path) → tensors; LLM models unchanged
+- deps: `transformers>=5.10,<5.11` via uv override (optimum-intel 2.1.0 still declares `<5.6`); add `pillow` + `numpy`; Makefile install/link pass `--overrides`
+- serve: FIX VLM image path: `_template_messages` preserves multimodal parts for chat template (tag inside user turn, not before bos); `DYNAMIC_QUANTIZATION_GROUP_SIZE=0` moved from VLM to LLM only (breaks Gemma4 VLM image: 0 tokens, empty output)
+
 ## 0.2.0 — 2026-08-29
 
 - serve: async-safe tool-calling + reasoning protocol (`tools=`/`enable_thinking` wiring into `apply_chat_template`, `_StreamParser` shared `<think>`/`<tool_call>` grammar for streaming+non-streaming, `reasoning_content` field, anti-loop fallback when a turn would otherwise end empty)
