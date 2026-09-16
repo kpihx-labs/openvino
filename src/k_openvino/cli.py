@@ -51,6 +51,114 @@ def _hf_id(arg: str, hf_opt: str | None) -> str:
     return arg
 
 
+def _optional_type_allowlist() -> set[str] | None:
+    """Optional restrict-only filter via OPENVINO_COMPATIBLE_TYPES.
+
+    Unset or empty = no type whitelist (any architecture allowed; disk/RAM gates remain).
+    Never hardcode model families in code: set the env only when you want a local lock-down.
+    """
+    raw = os.environ.get("OPENVINO_COMPATIBLE_TYPES", "").strip()
+    if not raw:
+        return None
+    return {t.strip() for t in raw.split(",") if t.strip()}
+
+
+def _config_is_multimodal(
+    config: dict | None, *, sibling_names: list[str] | None = None
+) -> bool:
+    """Detect multimodal export need from HF config STRUCTURE, not model-name lists.
+
+    Signals (architecture-agnostic): vision/audio/image config blocks, vision tower
+    fields, image token indices, architecture class names containing vision /
+    multimodal / vlm / unified / omni / visual, or processor_config siblings.
+    """
+    if isinstance(config, dict):
+        for key in (
+            "vision_config",
+            "audio_config",
+            "image_config",
+            "vision_tower",
+            "mm_vision_tower",
+            "image_token_index",
+            "image_seq_length",
+        ):
+            if config.get(key) is not None:
+                return True
+        for arch in config.get("architectures") or []:
+            if not isinstance(arch, str):
+                continue
+            al = arch.lower()
+            if any(
+                marker in al
+                for marker in (
+                    "vision",
+                    "multimodal",
+                    "vlm",
+                    "unified",
+                    "omni",
+                    "visual",
+                )
+            ):
+                return True
+    if sibling_names:
+        for name in sibling_names:
+            base = name.rsplit("/", 1)[-1].lower()
+            if base in ("processor_config.json", "preprocessor_config.json"):
+                return True
+    return False
+
+
+def _has_ir(dest: Path) -> bool:
+    """True if dest already holds a loadable OpenVINO IR (LLM or VLM layout)."""
+    return (dest / "openvino_model.xml").exists() or (
+        dest / "openvino_language_model.xml"
+    ).exists()
+
+
+def _patch_activations_scale_factor(dest: Path) -> None:
+    """Raise baked ACTIVATIONS_SCALE_FACTOR 8.0 when present (Arc f16 overflow guard).
+
+    Architecture-agnostic post-export fix for large-hidden VLMs on shared-memory GPUs.
+    Target scale: OPENVINO_ACTIVATIONS_SCALE (default 64.0). No-op if the rt_info
+    key is absent or already at/above target.
+    """
+    target = os.environ.get("OPENVINO_ACTIVATIONS_SCALE", "64.0").strip() or "64.0"
+    for xml_name in ("openvino_language_model.xml", "openvino_model.xml"):
+        xml = dest / xml_name
+        if not xml.exists():
+            continue
+        try:
+            text = xml.read_text()
+        except OSError:
+            continue
+        if "ACTIVATIONS_SCALE_FACTOR" not in text:
+            continue
+        patched = text
+        # Attribute form: <ACTIVATIONS_SCALE_FACTOR value="8.0" />
+        if 'ACTIVATIONS_SCALE_FACTOR value="8.0"' in patched:
+            patched = patched.replace(
+                'ACTIVATIONS_SCALE_FACTOR value="8.0"',
+                f'ACTIVATIONS_SCALE_FACTOR value="{target}"',
+            )
+        # Element forms used by older exporters
+        if patched == text:
+            patched = text.replace(
+                'name="ACTIVATIONS_SCALE_FACTOR">8.0<',
+                f'name="ACTIVATIONS_SCALE_FACTOR">{target}<',
+            )
+        if patched == text:
+            patched = text.replace(
+                "ACTIVATIONS_SCALE_FACTOR</name>\n\t\t<value>8.0</value>",
+                f"ACTIVATIONS_SCALE_FACTOR</name>\n\t\t<value>{target}</value>",
+            )
+        if patched != text:
+            xml.write_text(patched)
+            console.print(
+                f"[dim]✓ Patched {xml_name} ACTIVATIONS_SCALE_FACTOR 8.0 → {target}[/dim]"
+            )
+            return
+
+
 def _hf_accurate_size(api: object, hf_id: str) -> int | None:
     """Real download size in bytes for the checkpoint `optimum-cli` will actually load.
 
@@ -142,7 +250,7 @@ def ls() -> None:
     table.add_column("NAME", style="cyan")
     table.add_column("SIZE", justify="right")
     for p in sorted(md.iterdir()):
-        if p.is_dir() and (p / "openvino_model.xml").exists():
+        if p.is_dir() and _has_ir(p):
             total = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
             size = f"{total / 1e9:.2f} GB" if total > 1e9 else f"{total / 1e6:.0f} MB"
             table.add_row(p.name, size)
@@ -187,17 +295,49 @@ def pull(
         "-f",
         help="Force pull even if not safe (à vos risques et périls)",
     ),
+    task: str | None = typer.Option(
+        None,
+        "--task",
+        "-t",
+        help="Override optimum export task (auto: multimodal→image-text-to-text, else text-generation-with-past)",
+    ),
+    weight_format: str | None = typer.Option(
+        None,
+        "--weight-format",
+        "-w",
+        help="Override weight format (default for multimodal: OPENVINO_WEIGHT_FORMAT or int4)",
+    ),
 ) -> None:
     """Export a Hugging Face model to OpenVINO IR (like ollama pull) — strict by default, safe only."""
     hf_id = _hf_id(name, hf)
     local = _local_name(name if "/" not in name else hf_id)
     dest = _models_dir() / local
-    if dest.exists() and (dest / "openvino_model.xml").exists():
+    if dest.exists() and _has_ir(dest):
         console.print(
             f"[yellow]{local} already exists at {dest} — skip (rm first to re-pull)[/yellow]"
         )
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
+
+    # Probe HF once (size + config structure) for safety gates and export task selection
+    model_size = None
+    model_type = None
+    hf_config: dict | None = None
+    sibling_names: list[str] = []
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi()
+        model_size = _hf_accurate_size(api, hf_id)
+        info = api.model_info(hf_id, files_metadata=True)
+        if info.config and isinstance(info.config, dict):
+            hf_config = info.config
+            model_type = info.config.get("model_type")
+        sibling_names = [s.rfilename for s in (info.siblings or []) if s.rfilename]
+    except Exception:  # noqa: BLE001, S110
+        pass
+    is_multimodal = _config_is_multimodal(hf_config, sibling_names=sibling_names)
+
     # ── Strict, flexible, dynamic safety checks (disk/RAM/GPU) — block by default if not safe ──
     if not force:
         # PC caps (dynamic, no hardcoding)
@@ -242,36 +382,14 @@ def pull(
                 gpu_name = "Intel iGPU"
         except Exception:  # noqa: BLE001, S110
             pass
-        # Model caps via HF (size + type) — strict but flexible, dynamic (not hardcoded for one machine)
-        model_size = None
-        model_type = None
-        try:
-            from huggingface_hub import HfApi
-
-            api = HfApi()
-            model_size = _hf_accurate_size(api, hf_id)
-            info = api.model_info(hf_id)
-            # Type from config
-            if info.config and isinstance(info.config, dict):
-                model_type = info.config.get("model_type")
-            elif hasattr(info, "cardData") and info.cardData:
-                # fallback: try to get from cardData
-                pass
-        except Exception:  # noqa: BLE001, S110
-            pass
-        # Whitelist — dynamic, not hardcoded for one machine (override via OPENVINO_COMPATIBLE_TYPES)
-        compatible_types = set(
-            os.environ.get(
-                "OPENVINO_COMPATIBLE_TYPES",
-                "qwen3,qwen2,qwen,llama,mistral,gemma,phi,gpt_neox,chatglm",
-            ).split(",")
-        )
-        if model_type and model_type not in compatible_types:
+        # Optional type allowlist only when OPENVINO_COMPATIBLE_TYPES is set (no baked-in families)
+        allowlist = _optional_type_allowlist()
+        if allowlist is not None and model_type and model_type not in allowlist:
             console.print(
-                f"[red]✗ pull bloqué — model_type '{model_type}' non supporté sur Arc (whitelist: {', '.join(sorted(compatible_types))})[/red]"
+                f"[red]✗ pull bloqué — model_type '{model_type}' hors OPENVINO_COMPATIBLE_TYPES ({', '.join(sorted(allowlist))})[/red]"
             )
             console.print(
-                "[dim]Utilise --force pour forcer (à vos risques et périls)[/dim]"
+                "[dim]Unset OPENVINO_COMPATIBLE_TYPES to allow any type, or use --force[/dim]"
             )
             sys.exit(1)
         # Size checks (conservative: need disk 2× size + RAM 1.5× size)
@@ -321,6 +439,19 @@ def pull(
         console.print(
             "[dim]Fix: `hf auth login` (nouveau) ou `HF_TOKEN` dans ~/.agents/.env[/dim]"
         )
+    # Export task + weight format: structural multimodal detection, CLI/env overrides
+    export_task = task or (
+        "image-text-to-text" if is_multimodal else "text-generation-with-past"
+    )
+    export_wf = weight_format
+    if export_wf is None and is_multimodal:
+        export_wf = os.environ.get("OPENVINO_WEIGHT_FORMAT", "int4").strip() or "int4"
+    if is_multimodal:
+        console.print(
+            f"[dim]Multimodal config detected → task={export_task}"
+            + (f", weight-format={export_wf}" if export_wf else "")
+            + "[/dim]"
+        )
     # Locate optimum-cli robustly (project venv, uv tool venv, or PATH)
     import shutil as _shutil
 
@@ -334,6 +465,7 @@ def pull(
         candidates.append(Path(which))
     optimum = next((p for p in candidates if p.exists() and p.is_file()), None)
     use_uv_run = optimum is None
+    cmd: list[str]
     if use_uv_run:
         cmd = [
             "uv",
@@ -346,8 +478,7 @@ def pull(
             "--model",
             hf_id,
             "--task",
-            "text-generation-with-past",
-            str(dest),
+            export_task,
         ]
     else:
         cmd = [
@@ -357,14 +488,41 @@ def pull(
             "--model",
             hf_id,
             "--task",
-            "text-generation-with-past",
-            str(dest),
+            export_task,
         ]
+    if export_wf:
+        cmd.extend(["--weight-format", export_wf])
+    cmd.append(str(dest))
     console.print(f"[bold]Pulling[/bold] {hf_id} → [cyan]{dest}[/cyan]")
     console.print(f"[dim]{' '.join(cmd)}[/dim]")
     env = os.environ.copy()
+    # Persistent HF cache — NEVER wiped on success/failure (a previous finally
+    # rmtree deleted a full 23.9G download after an export iostream failure).
     hf_cache = Path.home() / ".cache/hf-export"
+    hf_cache.mkdir(parents=True, exist_ok=True)
     env["HF_HOME"] = str(hf_cache)
+    # INT4 export writes a TemporaryDirectory FP16 IR under TMPDIR. Default
+    # /tmp is often tmpfs (~16G) — too small for mid-size multimodal IR; the
+    # write then fails with RuntimeError: basic_ios::clear: iostream error
+    # (optimum-intel#1707). Force a disk-backed TMPDIR under $HOME.
+    export_tmp = Path.home() / ".cache/openvino-export-tmp"
+    export_tmp.mkdir(parents=True, exist_ok=True)
+    env["TMPDIR"] = str(export_tmp)
+    env["TMP"] = str(export_tmp)
+    env["TEMP"] = str(export_tmp)
+    try:
+        tmp_free = shutil.disk_usage(export_tmp).free
+    except Exception:  # noqa: BLE001
+        tmp_free = 0
+    # FP16 intermediate ≈ model size; need headroom for NNCF rewrite.
+    min_tmp = int((model_size or 0) * 1.5) if model_size else 40 * (1024**3)
+    if tmp_free and tmp_free < min_tmp and not force:
+        console.print(
+            f"[red]✗ pull bloqué — TMPDIR {export_tmp} free "
+            f"{tmp_free / 1e9:.1f}G < need ~{min_tmp / 1e9:.1f}G "
+            f"(INT4 needs disk-backed temp, not /tmp tmpfs)[/red]"
+        )
+        sys.exit(1)
     # Fix: HF_HOME override hides token at ~/.cache/huggingface/token → ensure HF_TOKEN is set
     if not env.get("HF_TOKEN"):
         token_path = Path.home() / ".cache/huggingface/token"
@@ -373,9 +531,7 @@ def pull(
                 env["HF_TOKEN"] = token_path.read_text().strip()
             except Exception:  # noqa: BLE001, S110
                 pass
-        # Also copy token files to custom HF_HOME for huggingface_hub's file lookup
         try:
-            hf_cache.mkdir(parents=True, exist_ok=True)
             for src_name in ("token", "stored_tokens"):
                 src = Path.home() / ".cache/huggingface" / src_name
                 dst = hf_cache / src_name
@@ -383,19 +539,22 @@ def pull(
                     shutil.copy(src, dst)
         except Exception:  # noqa: BLE001, S110
             pass
+    console.print(f"[dim]HF_HOME={hf_cache}  TMPDIR={export_tmp}[/dim]")
     try:
         subprocess.run(cmd, check=True, env=env)
+        _patch_activations_scale_factor(dest)
         console.print(
             f"[green]✓ {local} ready[/green] — try: openvino ls  &&  curl {_url()}/v1/models"
         )
     except subprocess.CalledProcessError as e:
         console.print(f"[red]pull failed: {e}[/red]")
+        console.print(
+            f"[yellow]HF cache kept at {hf_cache} (retry will reuse weights). "
+            f"Partial IR at {dest} removed.[/yellow]"
+        )
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
         sys.exit(1)
-    finally:
-        if hf_cache.exists():
-            shutil.rmtree(hf_cache, ignore_errors=True)
 
 
 @app.command("rm")
@@ -467,12 +626,7 @@ def search(
                         break
         except Exception:  # noqa: BLE001, S110
             pass
-        compatible_types = set(
-            os.environ.get(
-                "OPENVINO_COMPATIBLE_TYPES",
-                "qwen3,qwen2,qwen,llama,mistral,gemma,phi,gpt_neox,chatglm",
-            ).split(",")
-        )
+        allowlist = _optional_type_allowlist()
 
         # Parse max_params (e.g. 8B → 8e9) — flexible, dynamic
         max_size: float | None = None
@@ -530,8 +684,8 @@ def search(
             # Fallback: try model_info for more accurate size/type (but may be slow, so only if needed for strict check)
             # For strict mode, we need to know if it's compatible; if we can't get info, assume unknown and show as compatible
             reason = None
-            if m_type and m_type not in compatible_types:
-                reason = f"type {m_type} not in Arc whitelist"
+            if allowlist is not None and m_type and m_type not in allowlist:
+                reason = f"type {m_type} outside OPENVINO_COMPATIBLE_TYPES"
             elif m_size:
                 # Dynamic, not hardcoded for one machine — same env as pull
                 _disk_factor = float(os.environ.get("OPENVINO_DISK_FACTOR", "2.0"))

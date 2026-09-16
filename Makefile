@@ -33,7 +33,8 @@ smoke:  ## Smoke test — adjust to a real CLI/import check for this project
 # ── Install / Uninstall (uv tool) ────────────────────────────────────────────
 
 install:  ## Install via uv tool (non-editable)
-	@$(UV) tool install . --force
+	@printf '%s\n' 'transformers>=5.10.0,<5.11' > /tmp/openvino-uv-overrides.txt
+	@$(UV) tool install . --force --overrides /tmp/openvino-uv-overrides.txt
 	@mkdir -p ~/.config/systemd/user
 	@ln -sf $(PWD)/openvino.service ~/.config/systemd/user/openvino.service
 	@systemctl --user daemon-reload
@@ -41,7 +42,8 @@ install:  ## Install via uv tool (non-editable)
 	@echo "✅ $(PKG_NAME) installed + service @ ~/.config/systemd/user/openvino.service"
 
 link:  ## Install editable (dev) — CLI always uses the current checkout
-	@$(UV) tool install --editable . --force
+	@printf '%s\n' 'transformers>=5.10.0,<5.11' > /tmp/openvino-uv-overrides.txt
+	@$(UV) tool install --editable . --force --overrides /tmp/openvino-uv-overrides.txt
 	@mkdir -p ~/.config/systemd/user
 	@ln -sf $(PWD)/openvino.service ~/.config/systemd/user/openvino.service
 	@systemctl --user daemon-reload

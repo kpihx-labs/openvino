@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import gc
 import json
 import logging
 import multiprocessing as mp
 import os
 import queue
+import re
 import threading
 import time
 import uuid
@@ -16,10 +18,14 @@ from dataclasses import dataclass
 from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue as MPQueue
 from multiprocessing.synchronize import Event as MPEvent
+from pathlib import Path
 
+import numpy as np
+import openvino as ov
 import openvino_genai
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from PIL import Image
 from transformers import AutoTokenizer
 
 from k_openvino.config import CONFIG
@@ -89,10 +95,8 @@ def _normalize_content(content: object) -> str:
 
     `content` is either a plain string or a multimodal parts array
     (`{"type": "text", ...}` / `image_url` / `input_audio` / `file`, see the
-    OpenAI chat completions spec). Our current models are text-only, so
-    non-text parts are skipped — but centralizing extraction HERE means a
-    future image/video/audio OpenVINO backend only needs to extend this one
-    function, not every call site that reads message content.
+    OpenAI chat completions spec). Text parts are joined; non-text parts are
+    ignored here (images are collected separately via `_extract_images`).
     """
     if isinstance(content, str):
         return content
@@ -115,6 +119,227 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
             m2["content"] = _normalize_content(m2["content"])
         out.append(m2)
     return out
+
+
+def _template_messages(messages: list[dict]) -> list[dict]:
+    """Build messages for ``apply_chat_template``, preserving multimodal image parts.
+
+    ``_normalize_messages`` strips everything but text (good for token counting,
+    fatal for prompt building: the Gemma4 jinja only emits ``<|image|>`` when it
+    sees a ``{"type": "image_url"}`` / ``{"type": "image"}`` part in ``content``).
+    This keeps ``text`` + ``image``/``image_url`` parts in order and drops only the
+    modalities we have no tensors for (audio/video/file), so the template puts
+    the tag inside the user turn instead of us prepending it before ``<bos>``.
+
+    Args:
+        messages: OpenAI-format message list.  Each ``content`` may be a plain
+            string or a list of multimodal parts (``text``, ``image``,
+            ``image_url``, ``audio``, ``video``, ``file``).
+
+    Returns:
+        New list with the same structure, but ``audio``/``video``/``file`` parts
+        stripped (no tensor backing) while ``text``+``image`` parts preserved.
+
+    Examples:
+        >>> _template_messages([{"role": "user", "content": "hi"}])
+        [{"role": "user", "content": "hi"}]
+
+        >>> _template_messages([{"role": "user", "content": [
+        ...     {"type": "text", "text": "Describe"},
+        ...     {"type": "image_url", "image_url": {"url": "file:///a.png"}}
+        ... ]}])[0]["content"]
+        [{"type": "text", "text": "Describe"}, {"type": "image_url", ...}]
+    """
+    out: list[dict] = []
+    for m in messages:
+        m2 = dict(m)
+        content = m2.get("content")
+        if isinstance(content, list):
+            parts: list[dict] = []
+            for p in content:
+                if not isinstance(p, dict):
+                    continue
+                t = p.get("type")
+                if t == "text":
+                    parts.append({"type": "text", "text": p.get("text", "")})
+                elif t in ("image", "image_url"):
+                    parts.append(p)
+            m2["content"] = parts if parts else _normalize_content(content)
+        out.append(m2)
+    return out
+
+
+def _image_to_array(pic: Image.Image) -> np.ndarray:
+    """Convert a PIL image to NHWC u8 ndarray layout expected by VLMPipeline."""
+    rgb = pic.convert("RGB")
+    # Official GenAI samples force uint8 NHWC [1,H,W,3] — dtype drift breaks vision.
+    return np.asarray(rgb, dtype=np.uint8)[None]
+
+
+def _load_image_url(url: str) -> np.ndarray | None:
+    """Load an OpenAI `image_url` value (data URI or local path) into an NHWC array.
+
+    Remote http(s) URLs are intentionally unsupported here (sovereign local-only);
+    pass a data URI or an absolute filesystem path instead.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    raw = url.strip()
+    if raw.startswith("data:"):
+        # data:[<mediatype>][;base64],<data>
+        m = re.match(r"^data:[^;]*;base64,(.+)$", raw, flags=re.DOTALL)
+        if not m:
+            return None
+        try:
+            blob = base64.b64decode(m.group(1))
+        except Exception:  # noqa: BLE001
+            return None
+        from io import BytesIO
+
+        try:
+            return _image_to_array(Image.open(BytesIO(blob)))
+        except Exception:  # noqa: BLE001
+            return None
+    # file:///abs/path or plain filesystem path
+    raw = raw.removeprefix("file://")
+    path = Path(raw)
+    if path.is_file():
+        try:
+            return _image_to_array(Image.open(path))
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def _ensure_image_tags(prompt: str, n_images: int) -> str:
+    """Ensure the prompt references each image (GenAI / gemma4 need an image tag).
+
+    Without a tag, GenAI prepends the vision block before bos and vision binding
+    is scrambled.  Prefer native ``<|image|>`` when missing; also accept GenAI's
+    universal ``<ov_genai_image_i>`` if already present.  Fallback insertion
+    places the tag *inside* the user turn (after ``<|turn>user\\n``), never
+    before ``<bos>``.
+
+    Args:
+        prompt: Rendered chat prompt string (from ``apply_chat_template``).
+        n_images: Number of image tensors that will be passed to ``generate()``.
+
+    Returns:
+        Prompt with image tags injected if needed; unchanged if tags already
+        present or ``n_images <= 0``.
+
+    Examples:
+        >>> _ensure_image_tags("<bos>hello", 0)
+        '<bos>hello'
+
+        >>> _ensure_image_tags("<bos><|turn>user\\nHi<turn|>", 1)
+        '<bos><|turn>user\\n<|image|>Hi<turn|>'
+    """
+    if n_images <= 0:
+        return prompt
+    if (
+        "<|image|>" in prompt
+        or "<ov_genai_image_" in prompt
+        or "<start_of_image>" in prompt
+    ):
+        return prompt
+    tags = "".join("<|image|>" for _ in range(n_images))
+    # Fallback placement MUST stay inside the user turn — prepending before
+    # `<bos>` scrambles vision binding (same as having no tag at all). The
+    # native template path (`_template_messages`) already puts the tag
+    # correctly; this only rescues hand-built prompts that missed it.
+    marker = "<|turn>user\n"
+    idx = prompt.find(marker)
+    if idx != -1:
+        insert_at = idx + len(marker)
+        return prompt[:insert_at] + tags + prompt[insert_at:]
+    return f"{tags}{prompt}"
+
+
+def _extract_images(messages: list[dict]) -> list[np.ndarray]:
+    """Collect images from OpenAI multimodal message parts (architecture-agnostic).
+
+    Iterates over all messages, finds ``image_url`` parts, and loads each URL
+    (``file://`` path or plain filesystem path) into an NHWC ``uint8`` ndarray
+    suitable for ``openvino.Tensor``.
+
+    Args:
+        messages: OpenAI-format message list with optional ``content`` arrays
+            containing ``{"type": "image_url", "image_url": {"url": ...}}`` parts.
+
+    Returns:
+        List of NHWC ``uint8`` ndarrays, one per loadable image.  Empty list
+        if no images found or all URLs fail to load.
+
+    Examples:
+        >>> _extract_images([{"role": "user", "content": "hi"}])
+        []
+
+        >>> _extract_images([{"role": "user", "content": [
+        ...     {"type": "image_url", "image_url": {"url": "file:///a.png"}}
+        ... ]}])
+        [array([[[...]]], dtype=uint8)]
+    """
+    images: list[np.ndarray] = []
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") != "image_url":
+                continue
+            image_url = part.get("image_url")
+            url = image_url.get("url") if isinstance(image_url, dict) else image_url
+            arr = _load_image_url(url) if isinstance(url, str) else None
+            if arr is not None:
+                images.append(arr)
+    return images
+
+
+def _result_text(result: object) -> str:
+    """Normalize OpenVINO GenAI generate() output across LLM and VLM result types.
+
+    ``LLMPipeline.generate()`` returns a ``DecodedResults`` with a ``texts``
+    attribute; ``VLMPipeline.generate()`` returns a ``VLMDecodedResults`` with
+    either ``texts`` or ``text``.  This function extracts the first text string
+    from whichever format is present.
+
+    Args:
+        result: Raw return value from ``LLMPipeline.generate()`` or
+            ``VLMPipeline.generate()``.
+
+    Returns:
+        The generated text string, or ``str(result)`` as last resort.
+
+    Examples:
+        >>> _result_text(type("R", (), {"texts": ["hello"]})())
+        'hello'
+
+        >>> _result_text(type("R", (), {"text": "world"})())
+        'world'
+    """
+    if hasattr(result, "texts"):
+        texts = getattr(result, "texts", [])  # type: ignore[arg-type]
+        if texts:
+            return str(texts[0])
+    if hasattr(result, "text"):
+        return str(getattr(result, "text", ""))  # type: ignore[arg-type]
+    return str(result)
+
+
+def _ir_kind(model_dir: Path) -> str:
+    """Detect pipeline kind from IR layout on disk (no model-name hardcoding).
+
+    VLM exports write `openvino_language_model.xml` (+ vision embeddings);
+    plain CausalLM exports write `openvino_model.xml`.
+    """
+    if (model_dir / "openvino_language_model.xml").exists():
+        return "vlm"
+    if (model_dir / "openvino_model.xml").exists():
+        return "llm"
+    return "unknown"
 
 
 class _StreamParser:
@@ -270,26 +495,80 @@ def _model_ir(name: str):
     return discovered[name]["ir"]
 
 
+def _generate(
+    pipe,
+    prompt: str,
+    config,
+    *,
+    images: list | None = None,
+    streamer=None,
+):
+    """Call generate() on LLMPipeline or VLMPipeline with the right signature.
+
+    VLMPipeline rejects a positional GenerationConfig (text-only overload is
+    ``generate(prompt, **kwargs)``). LLMPipeline keeps the historical
+    positional ``generate(prompt, config, streamer=...)`` form.
+    """
+    is_vlm = isinstance(pipe, openvino_genai.VLMPipeline)
+    if is_vlm:
+        n_img = len(images) if images else 0
+        prompt = _ensure_image_tags(prompt, n_img)
+        kwargs: dict = {"generation_config": config}
+        if streamer is not None:
+            kwargs["streamer"] = streamer
+        if images:
+            kwargs["images"] = [
+                ov.Tensor(arr) if not isinstance(arr, ov.Tensor) else arr
+                for arr in images
+            ]
+        return pipe.generate(prompt, **kwargs)
+    if streamer is not None:
+        return pipe.generate(prompt, config, streamer=streamer)
+    return pipe.generate(prompt, config)
+
+
 def _build_pipeline(name: str, ir):
     device = os.environ.get("OPENVINO_DEVICE", "GPU")
-    # GPU Arc OOM even for 0.6B (5.4G peak + 3G swap) → LATENCY + 1 stream to cut VRAM
-    cfg: dict[str, str] = {}
+    # GPU Arc OOM even for 0.6B (5.4G peak + 3G swap) -> LATENCY + 1 stream to cut VRAM
+    cfg: dict = {}
     if device == "GPU":
         cfg = {"PERFORMANCE_HINT": "LATENCY", "NUM_STREAMS": "1"}
+    kind = _ir_kind(Path(ir))
+    # VLM INT4 on Arc: disable dynamic quantization (group size 0) -> community-
+    # validated for vision path; override via OPENVINO_DQ_GROUP_SIZE.
+    # NOTE (2026-09-16): DYNAMIC_QUANTIZATION_GROUP_SIZE=0 breaks Gemma4 VLM image
+    # path (0 completion tokens, empty output). Validated by A/B on GPU:
+    #   no props -> image works, DQ=0 -> empty. Only apply for LLM, not VLM.
+    if kind == "llm":
+        dq = os.environ.get("OPENVINO_DQ_GROUP_SIZE", "0")
+        try:
+            cfg["DYNAMIC_QUANTIZATION_GROUP_SIZE"] = int(dq)
+        except ValueError:
+            cfg["DYNAMIC_QUANTIZATION_GROUP_SIZE"] = 0
+    pipe_cls = (
+        openvino_genai.VLMPipeline if kind == "vlm" else openvino_genai.LLMPipeline
+    )
+
+    def _try(dev: str):
+        # GenAI constructors take properties as **kwargs, never a positional dict.
+        if cfg:
+            try:
+                return pipe_cls(str(ir), dev, **cfg)
+            except TypeError:
+                return pipe_cls(str(ir), dev)
+        return pipe_cls(str(ir), dev)
+
     try:
-        return (
-            openvino_genai.LLMPipeline(str(ir), device, cfg)
-            if cfg
-            else openvino_genai.LLMPipeline(str(ir), device)
-        )
+        return _try(device)
     except Exception as e:  # noqa: BLE001
         logger.warning(
-            "GPU load failed for %s (device=%s): %s — falling back to CPU",
+            "GPU load failed for %s (device=%s, kind=%s): %s — falling back to CPU",
             name,
             device,
+            kind,
             e,
         )
-        return openvino_genai.LLMPipeline(str(ir), "CPU")
+        return _try("CPU")
 
 
 def _get_tokenizer(name: str):
@@ -354,7 +633,14 @@ def _stream_worker_main(model_name: str, model_dir: str, cmd_q, event_q, cancel_
             return status
 
         try:
-            pipe.generate(cmd["prompt"], config, streamer=streamer)
+            # Images travel as picklable numpy arrays across the subprocess boundary
+            _generate(
+                pipe,
+                cmd["prompt"],
+                config,
+                images=cmd.get("images") or None,
+                streamer=streamer,
+            )
         except Exception as e:  # noqa: BLE001
             event_q.put(
                 {
@@ -482,10 +768,11 @@ def _discover_models() -> dict[str, dict]:
     for p in MODELS_DIR.iterdir():
         if not p.is_dir():
             continue
-        has_ir = (p / "openvino_model.xml").exists() and (
-            p / "openvino_model.bin"
+        kind = _ir_kind(p)
+        has_bin = (p / "openvino_model.bin").exists() or (
+            p / "openvino_language_model.bin"
         ).exists()
-        if has_ir:
+        if kind in ("llm", "vlm") and has_bin:
             # Read context_length and max_output_tokens from config.json
             context_length = CONFIG.max_context
             max_output_tokens = CONFIG.default_output_tokens
@@ -502,6 +789,17 @@ def _discover_models() -> dict[str, dict]:
                         if key in j and isinstance(j[key], int):
                             context_length = int(j[key])
                             break
+                    text_cfg = j.get("text_config")
+                    if isinstance(text_cfg, dict):
+                        for key in (
+                            "max_position_embeddings",
+                            "max_position",
+                            "model_max_length",
+                            "seq_length",
+                        ):
+                            if key in text_cfg and isinstance(text_cfg[key], int):
+                                context_length = int(text_cfg[key])
+                                break
                     for out_key in ("max_output_tokens", "max_new_tokens"):
                         if out_key in j and isinstance(j[out_key], int):
                             max_output_tokens = int(j[out_key])
@@ -516,6 +814,7 @@ def _discover_models() -> dict[str, dict]:
             )
             models[p.name] = {
                 "ir": p,
+                "kind": kind,
                 "context_length": context_length,
                 "max_output_tokens": max_output_tokens,
             }
@@ -684,6 +983,7 @@ async def chat(req: Request):
     max_tokens = int(body.get("max_tokens", 1024))
     temperature = float(body.get("temperature", 0.7))
     enable_thinking = bool(body.get("enable_thinking", CONFIG.default_enable_thinking))
+    images = await asyncio.to_thread(_extract_images, messages)
     tok = await asyncio.to_thread(_get_tokenizer, model)
     # `tools=` is what actually teaches the model tool-calling exists and how to
     # format it (Qwen's template injects the <tools>/<tool_call> instructions
@@ -693,7 +993,7 @@ async def chat(req: Request):
     # agent (Lite) should act, not ruminate for hundreds of tokens first.
     prompt = await asyncio.to_thread(
         tok.apply_chat_template,  # type: ignore[attr-defined]
-        _normalize_messages(messages),
+        _template_messages(messages),
         tools=tools,
         tokenize=False,
         add_generation_prompt=True,
@@ -716,10 +1016,16 @@ async def chat(req: Request):
                 content={"error": "model busy — try again momentarily", "model": model},
             )
         try:
-            result = await asyncio.to_thread(pipe.generate, prompt, config)  # type: ignore[union-attr]
+            result = await asyncio.to_thread(
+                _generate,
+                pipe,
+                prompt,
+                config,
+                images=images or None,
+            )
         finally:
             _gen_lock.release()
-        text = result.text if hasattr(result, "text") else str(result)
+        text = _result_text(result)
         parsed = await asyncio.to_thread(_parse_full, text)
         # Real usage for opencode's 490.9K (47%) · $59.11 display — was 0 (vide)
         prompt_tokens = await asyncio.to_thread(_token_count, tok, prompt)
@@ -791,6 +1097,8 @@ async def chat(req: Request):
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            # Picklable numpy arrays (reconstructed as ov.Tensor in the worker)
+            "images": images,
         }
     )
 
