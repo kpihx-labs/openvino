@@ -69,6 +69,15 @@ class Config:
     # kill the worker subprocess (covers the prefill-before-first-token case).
     stream_cancel_grace_seconds: float = 0.75
     stream_worker_shutdown_timeout_seconds: float = 2.0
+    # SSE keepalive cadence: while a streaming request is waiting for its first
+    # token (model load + prefill can take tens of seconds), emit a `: keepalive`
+    # SSE comment every N seconds so the client knows the server is alive.
+    # Without it a slow prefill is indistinguishable from a hang in the TUI.
+    heartbeat_seconds: float = 10.0
+    # Per-model override file, looked up inside each model directory. Any key it
+    # defines wins over the global defaults below (request body still wins over
+    # both). Keeps model-specific tuning next to the model it belongs to.
+    override_filename: str = "server.overrides.json"
 
     @property
     def url(self) -> str:

@@ -8,6 +8,16 @@ Environment=OPENVINO_HOME=%h/.local/share/openvino
 ExecStart=%h/.local/bin/openvino server start --foreground
 Restart=on-failure
 RestartSec=5
+# Memory containment. Without these the kernel OOM killer picks victims across
+# the whole user session: on 2026-09-16 it killed Edge, the browser-proxy
+# profile, Bitwarden, several tmux panes and user@1000 BEFORE reaching this
+# unit. MemoryHigh throttles (reclaim) first, MemoryMax is the hard ceiling,
+# and OOMPolicy=stop makes systemd stop and restart ONLY this unit instead of
+# letting the kernel choose. One model copy plus a 16K KV cache is ~13G, so
+# 18G is a soft warning line and 20G leaves ~10G for the desktop and agents.
+MemoryHigh=18G
+MemoryMax=20G
+OOMPolicy=stop
 
 [Install]
 WantedBy=default.target

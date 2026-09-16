@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 0.4.0 - 2026-09-16
+
+- serve: per-model overrides via `<model_dir>/server.overrides.json`: any key wins over the global default, so a model carries its own tuning wherever it is copied. Resolution order: request body > model override > `config.py`. Supported keys: `enable_thinking`, `max_context`, `default_output_tokens`, `device`, `performance_hint`, `num_streams`, `kv_cache_precision`, `extra_properties`. An override may lower the context but never exceed what the model itself declares
+- serve: FIX context limit is now ENFORCED, not merely advertised. A prompt at or above the effective `max_context` is rejected with HTTP 413 `context_length_exceeded` (prompt_tokens, context_limit, and a compact/shorten action), and `max_tokens` is clamped so prompt plus response always fits
+- serve: FIX stream worker death no longer hangs the client forever. The bridge now detects `not process.is_alive()`, reports a `WorkerDied` error through the stream, releases the generation lock, and finishes with `[DONE]`. Previously a worker killed without sending a result left the bridge spinning in `except queue.Empty`, holding the lock and starving every later request with a permanent 429
+- serve: SSE keepalive (`: keepalive`) every `heartbeat_seconds` (default 10) while a request waits for its first token, so a slow model load is no longer indistinguishable from a hang
+- serve: `metrics` block on both streaming and non-streaming responses: `device` (real execution device, so a silent GPU to CPU fallback is visible), `prefill_ms`, `total_ms`, `completion_tokens`, `tokens_per_s` (decode rate, computed from first-token time rather than end-to-end)
+- serve: `device` exposed on `/v1/models` and `/v1/model/info`; pipeline build logs the resolved device and properties at INFO, and the CPU fallback logs at ERROR
+- serve: shutdown-time worker death logged as WARNING (SIGTERM is orderly) instead of ERROR; SIGKILL still logs at ERROR
+- config: add `heartbeat_seconds` and `override_filename`
+- systemd: `MemoryHigh=18G`, `MemoryMax=20G`, `OOMPolicy=stop`: contains the service so an overrun stops THIS unit instead of letting the kernel OOM killer choose across the whole user session (it previously killed Edge, browser-proxy, Bitwarden, tmux panes and user@1000)
+- tests: 21 (was 13): per-model override resolution, override cannot inflate declared context, malformed override tolerance, 413 guard, dead-worker error path, metrics block
+
 ## 0.3.0 — 2026-09-15
 
 - cli: purge baked-in model-family whitelists — `OPENVINO_COMPATIBLE_TYPES` is optional restrict-only (unset = any architecture); multimodal export task chosen from HF config STRUCTURE (`vision_config` / architecture markers / processor siblings), never from a name list

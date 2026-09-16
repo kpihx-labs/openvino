@@ -38,6 +38,10 @@ logger = logging.getLogger("k_openvino")
 app = FastAPI(title="openvino-serve")
 _current: dict[str, object] = {"name": None, "pipe": None, "tok": None}
 _tokenizers: dict[str, object] = {}
+# Device actually used per model once the pipeline is built. The GPU -> CPU
+# fallback is otherwise silent, which made "is this running on the iGPU or
+# crawling on the CPU?" unanswerable from a client.
+_pipeline_devices: dict[str, str] = {}
 _gen_lock = threading.Lock()
 _stream_worker_lock = threading.Lock()
 
@@ -528,18 +532,55 @@ def _generate(
 
 
 def _build_pipeline(name: str, ir):
-    device = os.environ.get("OPENVINO_DEVICE", "GPU")
+    """Construct the GenAI pipeline for one model, honouring per-model overrides.
+
+    Resolution order for the device and every compile property, strongest first:
+      1. ``<model_dir>/server.overrides.json``
+      2. environment (``OPENVINO_DEVICE``, ``OPENVINO_DQ_GROUP_SIZE``)
+      3. built-in defaults (GPU, LATENCY, one stream)
+
+    The device actually used is recorded in ``_pipeline_devices`` so responses can
+    report it instead of the caller having to guess whether the silent CPU
+    fallback fired.
+
+    Args:
+        name: Model name as exposed by ``/v1/models``.
+        ir: Path to the model directory holding the IR.
+
+    Returns:
+        A ready ``LLMPipeline`` or ``VLMPipeline``.
+
+    Examples:
+        >>> _build_pipeline("qwen3-0.6b", "/models/qwen3-0.6b").__class__.__name__
+        'LLMPipeline'
+
+        >>> _pipeline_devices["gemma-4-12b-it"]
+        'GPU'
+    """
+    model_dir = Path(ir)
+    overrides = _read_model_overrides(model_dir)
+    device = str(overrides.get("device") or os.environ.get("OPENVINO_DEVICE", "GPU"))
     # GPU Arc OOM even for 0.6B (5.4G peak + 3G swap) -> LATENCY + 1 stream to cut VRAM
     cfg: dict = {}
     if device == "GPU":
         cfg = {"PERFORMANCE_HINT": "LATENCY", "NUM_STREAMS": "1"}
-    kind = _ir_kind(Path(ir))
+    # Per-model compile properties (override file wins over the GPU defaults above).
+    if "performance_hint" in overrides:
+        cfg["PERFORMANCE_HINT"] = str(overrides["performance_hint"])
+    if "num_streams" in overrides:
+        cfg["NUM_STREAMS"] = overrides["num_streams"]
+    if "kv_cache_precision" in overrides:
+        cfg["KV_CACHE_PRECISION"] = str(overrides["kv_cache_precision"])
+    extra = overrides.get("extra_properties")
+    if isinstance(extra, dict):
+        cfg.update(extra)
+    kind = _ir_kind(model_dir)
     # VLM INT4 on Arc: disable dynamic quantization (group size 0) -> community-
     # validated for vision path; override via OPENVINO_DQ_GROUP_SIZE.
     # NOTE (2026-09-16): DYNAMIC_QUANTIZATION_GROUP_SIZE=0 breaks Gemma4 VLM image
     # path (0 completion tokens, empty output). Validated by A/B on GPU:
     #   no props -> image works, DQ=0 -> empty. Only apply for LLM, not VLM.
-    if kind == "llm":
+    if kind == "llm" and "DYNAMIC_QUANTIZATION_GROUP_SIZE" not in cfg:
         dq = os.environ.get("OPENVINO_DQ_GROUP_SIZE", "0")
         try:
             cfg["DYNAMIC_QUANTIZATION_GROUP_SIZE"] = int(dq)
@@ -559,16 +600,30 @@ def _build_pipeline(name: str, ir):
         return pipe_cls(str(ir), dev)
 
     try:
-        return _try(device)
+        pipe = _try(device)
+        _pipeline_devices[name] = device
+        logger.info(
+            "Pipeline ready: model=%s kind=%s device=%s properties=%s",
+            name,
+            kind,
+            device,
+            cfg,
+        )
+        return pipe
     except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "GPU load failed for %s (device=%s, kind=%s): %s — falling back to CPU",
+        logger.error(
+            "Load failed for %s on device=%s (kind=%s): %s -- falling back to CPU",
             name,
             device,
             kind,
             e,
         )
-        return _try("CPU")
+        pipe = _try("CPU")
+        _pipeline_devices[name] = "CPU"
+        logger.warning(
+            "Pipeline fell back to CPU: model=%s requested_device=%s", name, device
+        )
+        return pipe
 
 
 def _get_tokenizer(name: str):
@@ -604,6 +659,10 @@ def _stream_worker_main(model_name: str, model_dir: str, cmd_q, event_q, cancel_
         parser = _StreamParser()
         completion_parts: list[str] = []
         tool_call_seen = False
+        # Timing for the metrics block: `started_at` is set just before generate()
+        # and `first_token_at` on the first streamer callback, so the client learns
+        # how much of the wall time was prefill (load + prompt) versus decoding.
+        timing: dict[str, float] = {"started_at": 0.0, "first_token_at": 0.0}
         config = openvino_genai.GenerationConfig()
         config.max_new_tokens = int(cmd["max_tokens"])
         temperature = float(cmd["temperature"])
@@ -616,8 +675,11 @@ def _stream_worker_main(model_name: str, model_dir: str, cmd_q, event_q, cancel_
             *,
             _completion_parts=completion_parts,
             _parser=parser,
+            _timing=timing,
         ):
             nonlocal tool_call_seen
+            if not _timing["first_token_at"]:
+                _timing["first_token_at"] = time.monotonic()
             if cancel_event.is_set():
                 return openvino_genai.StreamingStatus.CANCEL
             _completion_parts.append(subword)
@@ -634,6 +696,7 @@ def _stream_worker_main(model_name: str, model_dir: str, cmd_q, event_q, cancel_
 
         try:
             # Images travel as picklable numpy arrays across the subprocess boundary
+            timing["started_at"] = time.monotonic()
             _generate(
                 pipe,
                 cmd["prompt"],
@@ -652,11 +715,19 @@ def _stream_worker_main(model_name: str, model_dir: str, cmd_q, event_q, cancel_
         finally:
             for event in parser.finalize():
                 event_q.put({"kind": "event", "event": event})
+            finished_at = time.monotonic()
+            started_at = timing["started_at"] or finished_at
+            first_token_at = timing["first_token_at"] or finished_at
+            decode_seconds = max(finished_at - first_token_at, 1e-6)
             event_q.put(
                 {
                     "kind": "done",
                     "completion": "".join(completion_parts),
                     "finish_reason": "tool_calls" if tool_call_seen else "stop",
+                    "prefill_ms": round((first_token_at - started_at) * 1000),
+                    "total_ms": round((finished_at - started_at) * 1000),
+                    "completion_tokens": len(completion_parts),
+                    "tokens_per_s": round(len(completion_parts) / decode_seconds, 2),
                     "cancelled": cancel_event.is_set(),
                 }
             )
@@ -761,6 +832,48 @@ async def _watch_disconnect(
         await asyncio.sleep(0.05)
 
 
+def _read_model_overrides(model_dir: Path) -> dict:
+    """Read per-model overrides from ``<model_dir>/server.overrides.json``.
+
+    The file lives inside the model directory so a model carries its own tuning
+    wherever it is copied. Every key is optional; a missing or unreadable file
+    simply means "use the global defaults".
+
+    Args:
+        model_dir: Directory holding the exported OpenVINO IR for one model.
+
+    Returns:
+        Parsed override mapping, or an empty dict when absent, unreadable,
+        malformed JSON, or not a JSON object.
+
+    Examples:
+        >>> _read_model_overrides(Path("/models/gemma-4-12b-it"))
+        {"enable_thinking": False, "max_context": 16384}
+
+        >>> _read_model_overrides(Path("/models/qwen3-0.6b"))
+        {}
+    """
+    path = model_dir / CONFIG.override_filename
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(
+            "Ignoring %s for %s: %s", CONFIG.override_filename, model_dir.name, e
+        )
+        return {}
+    if not isinstance(data, dict):
+        logger.warning(
+            "Ignoring %s for %s: root is %s, expected object",
+            CONFIG.override_filename,
+            model_dir.name,
+            type(data).__name__,
+        )
+        return {}
+    return data
+
+
 def _discover_models() -> dict[str, dict]:
     models: dict[str, dict] = {}
     if not MODELS_DIR.exists():
@@ -806,19 +919,66 @@ def _discover_models() -> dict[str, dict]:
                             break
                 except Exception:  # noqa: BLE001, S110
                     pass
-            context_length = min(context_length, CONFIG.max_context)
-            # Never a ratio of context_length — a flat absolute default, capped only as a
-            # safety net for a hypothetical future model with a smaller context than the default.
-            max_output_tokens = min(
-                max_output_tokens, CONFIG.default_output_tokens, context_length
-            )
+            # `context_length` above is what the model itself declares (Gemma4
+            # declares 262144). Resolution order, strongest first:
+            #   1. per-model override (`server.overrides.json`)
+            #   2. global default (`CONFIG.max_context`)
+            # The model's own declaration stays a hard ceiling — advertising more
+            # context than the model supports is never useful.
+            overrides = _read_model_overrides(p)
+            declared_ctx = context_length
+            ov_ctx = overrides.get("max_context")
+            if isinstance(ov_ctx, int) and ov_ctx > 0:
+                context_length = min(ov_ctx, declared_ctx)
+            else:
+                context_length = min(declared_ctx, CONFIG.max_context)
+            # Never a ratio of context_length — a flat absolute default, capped only
+            # as a safety net for a hypothetical future model with a smaller context
+            # than the default. A per-model override replaces both flat defaults.
+            ov_out = overrides.get("default_output_tokens")
+            if isinstance(ov_out, int) and ov_out > 0:
+                max_output_tokens = min(ov_out, context_length)
+            else:
+                max_output_tokens = min(
+                    max_output_tokens, CONFIG.default_output_tokens, context_length
+                )
             models[p.name] = {
                 "ir": p,
                 "kind": kind,
                 "context_length": context_length,
                 "max_output_tokens": max_output_tokens,
+                "overrides": overrides,
             }
     return models
+
+
+def _effective_device(name: str) -> str:
+    """Report the device a model is loaded on, or would load on if untouched.
+
+    Prefers the recorded runtime value (``_pipeline_devices``) so a silent
+    GPU -> CPU fallback is visible to clients, and falls back to the configured
+    value before the first load.
+
+    Args:
+        name: Model name as exposed by ``/v1/models``.
+
+    Returns:
+        ``"GPU"``, ``"CPU"``, or any other OpenVINO device string.
+
+    Examples:
+        >>> _effective_device("gemma-4-12b-it")   # after a GPU load
+        'GPU'
+
+        >>> _effective_device("qwen3-0.6b")       # never loaded yet
+        'GPU'
+    """
+    if name in _pipeline_devices:
+        return _pipeline_devices[name]
+    found = _discover_models().get(name)
+    if found:
+        overrides = found.get("overrides") or {}
+        return str(overrides.get("device") or os.environ.get("OPENVINO_DEVICE", "GPU"))
+    return os.environ.get("OPENVINO_DEVICE", "GPU")
 
 
 def _load(name: str):
@@ -856,6 +1016,8 @@ def list_models():
             "max_output_tokens": info.get(
                 "max_output_tokens", CONFIG.default_output_tokens
             ),
+            # Real execution device — makes a silent GPU -> CPU fallback visible.
+            "device": _effective_device(m),
         }
         for m, info in sorted(models.items())
     ]
@@ -885,6 +1047,8 @@ def model_info():
                 ),
                 "supports_reasoning": True,
                 "supports_function_calling": True,
+                # Reported so a caller can see which device actually serves it.
+                "device": _effective_device(m),
             },
         }
         for m, info in sorted(models.items())
@@ -980,9 +1144,21 @@ async def chat(req: Request):
     messages = body.get("messages", [])
     tools = body.get("tools") or None
     stream = body.get("stream", False)
+    info = discovered[model]
+    overrides = info.get("overrides") or {}
+    # Defensive lookup: the discovery mapping is an internal contract, but a
+    # missing key must never turn a request into a 500.
+    context_limit = int(info.get("context_length") or CONFIG.max_context)
+    # Resolution order for the model-specific knobs, strongest first:
+    #   1. request body   2. <model_dir>/server.overrides.json   3. config.py
     max_tokens = int(body.get("max_tokens", 1024))
     temperature = float(body.get("temperature", 0.7))
-    enable_thinking = bool(body.get("enable_thinking", CONFIG.default_enable_thinking))
+    enable_thinking = bool(
+        body.get(
+            "enable_thinking",
+            overrides.get("enable_thinking", CONFIG.default_enable_thinking),
+        )
+    )
     images = await asyncio.to_thread(_extract_images, messages)
     tok = await asyncio.to_thread(_get_tokenizer, model)
     # `tools=` is what actually teaches the model tool-calling exists and how to
@@ -999,6 +1175,39 @@ async def chat(req: Request):
         add_generation_prompt=True,
         enable_thinking=enable_thinking,
     )
+    # Enforce the advertised context limit. Until now `max_input_tokens` was only
+    # published in /v1/model/info and never checked, so an oversized prompt went
+    # straight to prefill and could exhaust memory before failing.
+    prompt_tokens = await asyncio.to_thread(_token_count, tok, prompt)
+    if prompt_tokens >= context_limit:
+        logger.warning(
+            "Rejecting %s: prompt=%d tokens >= context_limit=%d",
+            model,
+            prompt_tokens,
+            context_limit,
+        )
+        return JSONResponse(
+            status_code=413,
+            content={
+                "error": {
+                    "type": "context_length_exceeded",
+                    "message": (
+                        f"prompt is {prompt_tokens} tokens but model '{model}' "
+                        f"accepts at most {context_limit}"
+                    ),
+                    "model": model,
+                    "prompt_tokens": prompt_tokens,
+                    "context_limit": context_limit,
+                    "action": (
+                        "compact or shorten the conversation, drop unused "
+                        "attachments, or raise max_context in the model's "
+                        "server.overrides.json"
+                    ),
+                }
+            },
+        )
+    # Leave room for the response instead of letting the engine truncate silently.
+    max_tokens = max(1, min(max_tokens, context_limit - prompt_tokens))
     config = openvino_genai.GenerationConfig()
     config.max_new_tokens = max_tokens
     config.do_sample = temperature > 0
@@ -1015,6 +1224,19 @@ async def chat(req: Request):
                 status_code=429,
                 content={"error": "model busy — try again momentarily", "model": model},
             )
+        # A timing-only streamer: this response needs no chunks, but it does need
+        # to know WHEN the first token arrived. Without that, the reported rate
+        # would silently fold prefill (model load + prompt) into decode speed.
+        timing: dict[str, float] = {
+            "started_at": time.monotonic(),
+            "first_token_at": 0.0,
+        }
+
+        def _first_token_probe(subword: str, *, _timing=timing):
+            if not _timing["first_token_at"]:
+                _timing["first_token_at"] = time.monotonic()
+            return openvino_genai.StreamingStatus.RUNNING
+
         try:
             result = await asyncio.to_thread(
                 _generate,
@@ -1022,9 +1244,15 @@ async def chat(req: Request):
                 prompt,
                 config,
                 images=images or None,
+                streamer=_first_token_probe,
             )
         finally:
             _gen_lock.release()
+        gen_finished_at = time.monotonic()
+        gen_total_ms = round((gen_finished_at - timing["started_at"]) * 1000)
+        decode_seconds = max(
+            gen_finished_at - (timing["first_token_at"] or gen_finished_at), 1e-6
+        )
         text = _result_text(result)
         parsed = await asyncio.to_thread(_parse_full, text)
         # Real usage for opencode's 490.9K (47%) · $59.11 display — was 0 (vide)
@@ -1064,6 +1292,24 @@ async def chat(req: Request):
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
+            },
+            # Execution facts instead of guesswork: which device really served the
+            # request, the prompt prefill time (generate start -> first token), and
+            # the decode rate. Model LOAD time is not in here: while the worker is
+            # loading, the client sees `: keepalive` SSE comments instead. A silent
+            # GPU -> CPU fallback or a pathological prompt shows up here.
+            "metrics": {
+                "device": _effective_device(model),
+                "prefill_ms": round(
+                    (
+                        (timing["first_token_at"] or gen_finished_at)
+                        - timing["started_at"]
+                    )
+                    * 1000
+                ),
+                "total_ms": gen_total_ms,
+                "completion_tokens": completion_tokens,
+                "tokens_per_s": round(completion_tokens / decode_seconds, 2),
             },
         }
     # Streaming uses a dedicated worker subprocess per active model. Level 1:
@@ -1110,8 +1356,46 @@ async def chat(req: Request):
                 except queue.Empty:
                     if worker_done.is_set():
                         break
-                    if state.cancel_event.is_set() and not state.process.is_alive():
-                        worker_result["cancelled"] = True
+                    # A dead worker is otherwise invisible: without this check the
+                    # loop spins forever, `worker_done` is never set, `_gen_lock`
+                    # is never released, and every later request gets a permanent
+                    # 429 while the client waits on an open stream that will never
+                    # send anything. Treat "worker gone" as a first-class outcome.
+                    if not state.process.is_alive():
+                        # None while the process is still being reaped; a negative
+                        # value means it was killed by a signal (-15 = SIGTERM).
+                        exitcode = getattr(state.process, "exitcode", None)
+                        if state.cancel_event.is_set():
+                            worker_result["cancelled"] = True
+                            logger.info(
+                                "Stream worker exited after cancel: model=%s", model
+                            )
+                        else:
+                            worker_result["error"] = {
+                                "message": (
+                                    "stream worker process exited unexpectedly "
+                                    "without sending a result (likely out of "
+                                    "memory or a hard crash); no partial output "
+                                    "is available"
+                                ),
+                                "code": "WorkerDied",
+                            }
+                            # SIGTERM is what systemd sends on an orderly stop, so it
+                            # is expected noise; SIGKILL is the OOM killer or a
+                            # forced teardown and must stay loud.
+                            if exitcode == -15:
+                                logger.warning(
+                                    "Stream worker stopped on SIGTERM (orderly "
+                                    "shutdown): model=%s",
+                                    model,
+                                )
+                            else:
+                                logger.error(
+                                    "Stream worker died without result: model=%s "
+                                    "exitcode=%s",
+                                    model,
+                                    exitcode,
+                                )
                         worker_done.set()
                         break
                     continue
@@ -1142,8 +1426,19 @@ async def chat(req: Request):
         content_seen = False
         reasoning_parts: list[str] = []
         tool_call_index = 0
+        last_keepalive = time.monotonic()
         while True:
-            event = q.get()
+            # Bounded wait instead of a blocking get(): while the worker loads the
+            # model and prefills a long prompt, no token exists yet, and a silent
+            # connection is indistinguishable from a hang in the client UI. Emit a
+            # standard SSE comment (`: keepalive`) so the client knows it is alive.
+            try:
+                event = q.get(timeout=1.0)
+            except queue.Empty:
+                if time.monotonic() - last_keepalive >= CONFIG.heartbeat_seconds:
+                    last_keepalive = time.monotonic()
+                    yield ": keepalive\n\n"
+                continue
             if event is None:
                 break
             if event["type"] == "content":
@@ -1281,6 +1576,16 @@ async def chat(req: Request):
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
                         "total_tokens": prompt_tokens + completion_tokens,
+                    },
+                    # Same execution facts as the non-streaming path: real device,
+                    # prompt prefill versus decode, and the decode rate. Model load
+                    # is not counted here — this request's keepalives cover it.
+                    "metrics": {
+                        "device": _effective_device(model),
+                        "prefill_ms": worker_result.get("prefill_ms"),
+                        "total_ms": worker_result.get("total_ms"),
+                        "completion_tokens": worker_result.get("completion_tokens"),
+                        "tokens_per_s": worker_result.get("tokens_per_s"),
                     },
                 }
             )

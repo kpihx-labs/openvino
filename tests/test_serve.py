@@ -33,8 +33,9 @@ class FakePipeline:
 
 
 class FakeAliveProcess:
-    def __init__(self, *, alive=True):
+    def __init__(self, *, alive=True, exitcode=None):
         self._alive = alive
+        self.exitcode = exitcode
 
     def is_alive(self):
         return self._alive
@@ -52,13 +53,13 @@ class FakeWorkerCommandQueue:
             self.event_q.put(msg)
 
 
-def make_fake_stream_worker(messages):
+def make_fake_stream_worker(messages, *, alive=True):
     event_q = queue.Queue()
     # Fakes duck-type the real multiprocessing Process/Queue/Event interface —
     # same typeshed-vs-runtime gap as serve.py's own `ctx.Process` comment.
     return serve._StreamWorkerState(
         model="qwen3-4b",
-        process=FakeAliveProcess(),  # type: ignore[arg-type]
+        process=FakeAliveProcess(alive=alive, exitcode=None if alive else -9),  # type: ignore[arg-type]
         cmd_q=FakeWorkerCommandQueue(event_q, messages),  # type: ignore[arg-type]
         event_q=event_q,  # type: ignore[arg-type]
         cancel_event=threading.Event(),  # type: ignore[arg-type]
@@ -323,3 +324,202 @@ async def test_watch_disconnect_cancels_then_terminates_worker(monkeypatch):
     )
     assert state.cancel_event.is_set()
     assert calls == [state]
+
+
+# ---------------------------------------------------------------------------
+# Per-model overrides (`server.overrides.json` living inside the model dir)
+# ---------------------------------------------------------------------------
+
+
+def test_read_model_overrides_reads_json_object(tmp_path):
+    (tmp_path / serve.CONFIG.override_filename).write_text(
+        '{"enable_thinking": false, "max_context": 4096}'
+    )
+    assert serve._read_model_overrides(tmp_path) == {
+        "enable_thinking": False,
+        "max_context": 4096,
+    }
+
+
+def test_read_model_overrides_tolerates_missing_and_malformed(tmp_path):
+    """A bad override file must never break model discovery — just be ignored."""
+    # Absent file -> defaults
+    assert serve._read_model_overrides(tmp_path) == {}
+    # Malformed JSON -> defaults
+    override = tmp_path / serve.CONFIG.override_filename
+    override.write_text("{not: valid json")
+    assert serve._read_model_overrides(tmp_path) == {}
+    # Valid JSON but not an object -> defaults
+    override.write_text('["not", "an", "object"]')
+    assert serve._read_model_overrides(tmp_path) == {}
+
+
+def _write_fake_model(root, name, *, declared_ctx=131072, override=None):
+    """Create a minimal LLM-layout model dir that _discover_models will accept."""
+    model_dir = root / name
+    model_dir.mkdir(parents=True)
+    (model_dir / "openvino_model.xml").write_text("<net/>")
+    (model_dir / "openvino_model.bin").write_text("weights")
+    (model_dir / "config.json").write_text(
+        json.dumps({"max_position_embeddings": declared_ctx})
+    )
+    if override is not None:
+        (model_dir / serve.CONFIG.override_filename).write_text(json.dumps(override))
+    return model_dir
+
+
+def test_discover_models_applies_per_model_override(monkeypatch, tmp_path):
+    """The override file wins over the global defaults, per model only."""
+    _write_fake_model(
+        tmp_path,
+        "overridden",
+        declared_ctx=131072,
+        override={
+            "enable_thinking": False,
+            "max_context": 4096,
+            "default_output_tokens": 512,
+        },
+    )
+    _write_fake_model(tmp_path, "untouched", declared_ctx=131072)
+    monkeypatch.setattr(serve, "MODELS_DIR", tmp_path)
+
+    models = serve._discover_models()
+
+    # Overridden model: the file's values win over every global default.
+    assert models["overridden"]["context_length"] == 4096
+    assert models["overridden"]["max_output_tokens"] == 512
+    assert models["overridden"]["overrides"]["enable_thinking"] is False
+
+    # Untouched model: global defaults still apply (min of declared and cap).
+    assert models["untouched"]["context_length"] == serve.CONFIG.max_context
+    assert models["untouched"]["max_output_tokens"] == serve.CONFIG.default_output_tokens
+    assert models["untouched"]["overrides"] == {}
+
+
+def test_override_cannot_exceed_what_the_model_declares(monkeypatch, tmp_path):
+    """An override may lower the context, never inflate it past the model's own."""
+    _write_fake_model(tmp_path, "small", declared_ctx=2048, override={"max_context": 999999})
+    monkeypatch.setattr(serve, "MODELS_DIR", tmp_path)
+    assert serve._discover_models()["small"]["context_length"] == 2048
+
+
+def test_effective_device_prefers_recorded_runtime_value(monkeypatch):
+    """A silent GPU -> CPU fallback must be reportable to clients."""
+    monkeypatch.setitem(serve._pipeline_devices, "qwen3-4b", "CPU")
+    assert serve._effective_device("qwen3-4b") == "CPU"
+
+
+# ---------------------------------------------------------------------------
+# Context-length guard (413) and dead-worker detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_oversized_prompt_is_rejected_with_413(monkeypatch):
+    """Advertised max_input_tokens is now enforced, not just published."""
+    tokenizer = FakeTokenizer()  # encode() -> one token per character ("prompt") = 6
+    monkeypatch.setattr(
+        serve,
+        "_discover_models",
+        lambda: {"qwen3-4b": {"ir": "unused", "context_length": 3}},
+    )
+    monkeypatch.setattr(serve, "_get_tokenizer", lambda model: tokenizer)
+
+    transport = httpx.ASGITransport(app=serve.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3-4b",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+
+    assert response.status_code == 413
+    error = response.json()["error"]
+    assert error["type"] == "context_length_exceeded"
+    assert error["prompt_tokens"] == 6
+    assert error["context_limit"] == 3
+    assert "compact" in error["action"]
+
+
+@pytest.mark.asyncio
+async def test_dead_worker_surfaces_error_instead_of_hanging(monkeypatch):
+    """Regression guard for the silent infinite wait: a worker that dies without
+    sending `done`/`error` must produce a visible error, not an eternal stream."""
+    tokenizer = FakeTokenizer()
+    monkeypatch.setattr(
+        serve, "_discover_models", lambda: {"qwen3-4b": {"ir": "unused"}}
+    )
+    monkeypatch.setattr(serve, "_get_tokenizer", lambda model: tokenizer)
+    monkeypatch.setattr(
+        serve,
+        "_ensure_stream_worker",
+        lambda model: make_fake_stream_worker([], alive=False),
+    )
+
+    transport = httpx.ASGITransport(app=serve.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3-4b",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert "WorkerDied" in response.text
+    # The stream must terminate cleanly rather than being cut mid-flight.
+    assert response.text.rstrip().endswith("data: [DONE]")
+
+
+@pytest.mark.asyncio
+async def test_stream_emits_metrics_block(monkeypatch):
+    """Device and timing facts travel with the stream so a client is never blind."""
+    tokenizer = FakeTokenizer()
+    monkeypatch.setattr(
+        serve, "_discover_models", lambda: {"qwen3-4b": {"ir": "unused"}}
+    )
+    monkeypatch.setattr(serve, "_get_tokenizer", lambda model: tokenizer)
+    monkeypatch.setattr(
+        serve,
+        "_ensure_stream_worker",
+        lambda model: make_fake_stream_worker(
+            [
+                {"kind": "event", "event": {"type": "content", "text": "hi"}},
+                {
+                    "kind": "done",
+                    "completion": "hi",
+                    "finish_reason": "stop",
+                    "cancelled": False,
+                    "prefill_ms": 123,
+                    "total_ms": 456,
+                    "completion_tokens": 1,
+                    "tokens_per_s": 12.5,
+                },
+            ]
+        ),
+    )
+
+    transport = httpx.ASGITransport(app=serve.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3-4b",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True,
+            },
+        )
+
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    metrics = events[-1]["metrics"]
+    assert metrics["device"] == "GPU"
+    assert metrics["prefill_ms"] == 123
+    assert metrics["tokens_per_s"] == 12.5
